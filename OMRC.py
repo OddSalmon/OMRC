@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import time
 
 # --- Инициализация терминала ---
-st.set_page_config(page_title="MRC Quantum Terminal v10.2", layout="wide")
+st.set_page_config(page_title="MRC Quantum Terminal v10.3", layout="wide")
 
 st.markdown("""
     <style>
@@ -21,7 +21,7 @@ st.markdown("""
 
 HL_URL = "https://api.hyperliquid.xyz/info"
 
-# --- Математическое ядро ---
+# --- Математические функции ---
 def ss_filter(data, l):
     res = np.zeros_like(data)
     arg = np.sqrt(2) * np.pi / l
@@ -55,11 +55,12 @@ def get_tokens():
     except: return ["BTC", "ETH", "SOL"]
 
 def fetch_data(coin, interval, days_back):
-    """Улучшенная загрузка: обход лимита 5000 свечей"""
     start_ts = int((datetime.now() - timedelta(days=days_back)).timestamp() * 1000)
+    # Hyperliquid limit: 5000 candles
     payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "startTime": start_ts}}
     try:
         r = requests.post(HL_URL, json=payload, timeout=15)
+        if r.status_code != 200: return pd.DataFrame()
         df = pd.DataFrame(r.json())
         if df.empty: return df
         df = df.rename(columns={'t':'ts','o':'open','h':'high','l':'low','c':'close','v':'vol'})
@@ -68,23 +69,21 @@ def fetch_data(coin, interval, days_back):
         return df
     except: return pd.DataFrame()
 
-# --- Глубокий Оптимизатор (v10.2 Fixed) ---
+# --- Глубокий Оптимизатор v10.3 (Fixed Probability) ---
 def run_full_optimization(coin, period_days):
-    # Если период большой, используем 5m как базу для 1-60m оптимизации, чтобы хватило истории
-    base_tf = "1m" if period_days <= 3 else "5m"
+    # Выбор базового ТФ для охвата всей истории
+    base_tf = "1m" if period_days <= 2 else "5m" if period_days <= 10 else "15m"
     df_base = fetch_data(coin, base_tf, days_back=period_days)
     if df_base.empty: return None
 
     best_p = {"score": -1}
-    # Шаг в 1 минуту до часа
-    tfs = range(1, 61) if base_tf == "1m" else range(5, 65, 5) 
+    tfs = range(1, 61) if base_tf == "1m" else range(base_tf=="5m" and 5 or 15, 65, 5) 
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     for i, tf in enumerate(tfs):
-        status_text.text(f"Оптимизация ТФ: {tf} мин... ({i+1}/{len(tfs)})")
-        # Ресемплинг под конкретный ТФ
+        status_text.text(f"Квантовый расчет ТФ: {tf} мин...")
         df_tf = df_base.set_index('ts').resample(f'{tf}T').agg({
             'open':'first','high':'max','low':'min','close':'last','vol':'sum'
         }).dropna().reset_index()
@@ -92,25 +91,27 @@ def run_full_optimization(coin, period_days):
         if len(df_tf) < 260: continue
         
         for l in [150, 200, 250]:
+            # Динамическое окно возврата (10% от Length)
+            lookback_window = max(15, int(l * 0.1))
+            
             for m in [2.1, 2.4, 2.8]:
                 df_mrc = calculate_mrc(df_tf.copy(), l, m)
-                # Оцениваем всю доступную историю, а не только хвост
                 test_slice = df_mrc.iloc[l:] 
                 ob = test_slice[test_slice['high'] >= test_slice['u2']].index
                 os = test_slice[test_slice['low'] <= test_slice['l2']].index
                 sigs = list(ob) + list(os)
                 
-                if len(sigs) < 5: continue
+                if len(sigs) < 4: continue
                 
                 reversions = 0
                 for idx in sigs:
-                    future = df_mrc.loc[idx : idx + 10]
+                    # Окно ожидания возврата масштабируется
+                    future = df_mrc.loc[idx : idx + lookback_window]
                     if not future.empty and ((future['low'] <= future['ml']) & (future['high'] >= future['ml'])).any():
                         reversions += 1
                 
                 rev_rate = reversions / len(sigs)
-                # Score учитывает стабильность (кол-во сигналов) и вер. возврата
-                score = (rev_rate * np.log10(len(sigs))) / (df_mrc['u2'].mean() - df_mrc['l2'].mean())
+                score = (rev_rate * np.sqrt(len(sigs))) / (df_mrc['u2'].mean() - df_mrc['l2'].mean())
                 
                 if score > best_p['score']:
                     best_p = {"tf": tf, "l": l, "m": m, "score": score, "rev": rev_rate}
@@ -122,37 +123,36 @@ def run_full_optimization(coin, period_days):
 
 # --- Sidebar ---
 with st.sidebar:
-    st.header("🧬 MRC Terminal v10.2")
+    st.header("🧬 MRC Terminal v10.3")
     tokens = get_tokens()
-    # BTC по умолчанию
     target_coin = st.selectbox("Актив", tokens, index=tokens.index("BTC") if "BTC" in tokens else 0)
     
     st.divider()
     st.subheader("Глубина Оптимизации")
-    opt_period = st.selectbox("История данных", options=["1 День", "1 Неделя", "1 Месяц"], index=1)
+    opt_period_label = st.selectbox("Период истории", options=["1 День", "1 Неделя", "1 Месяц"], index=1)
     period_map = {"1 День": 1, "1 Неделя": 7, "1 Месяц": 30}
+    days_back = period_map[opt_period_label]
     
     if 'cfg' not in st.session_state:
         st.session_state.cfg = {"tf": 60, "l": 200, "m": 2.4, "rev": 0}
 
-    # Только кнопка оптимизации (ручной ввод удален)
     if st.button("🔥 ГЛУБОКАЯ ОПТИМИЗАЦИЯ (1-60М)"):
-        with st.spinner(f"Анализ {target_coin} за {opt_period}..."):
-            best = run_full_optimization(target_coin, period_map[opt_period])
+        with st.spinner(f"Анализ {target_coin} за {opt_period_label}..."):
+            best = run_full_optimization(target_coin, days_back)
             if best:
                 st.session_state.cfg = best
                 st.success(f"Идеал найден: {best['tf']} мин")
             else:
-                st.error("Ошибка API: Попробуйте выбрать меньший период.")
+                st.error("Ошибка API: Недостаточно данных для периода.")
 
 # --- Вкладки ---
 tab1, tab2 = st.tabs(["📊 Терминал (Live)", "🔍 Рыночный Скринер"])
 
 with tab1:
-    # Загружаем данные для графика (всегда 1m для четкости, если ТФ позволяет)
-    df_raw = fetch_data(target_coin, "1m" if st.session_state.cfg['tf'] <= 60 else "5m", days_back=3)
-    if not df_raw.empty:
-        df_main = df_raw.set_index('ts').resample(f"{st.session_state.cfg['tf']}T").agg({
+    # Загружаем данные для графика на основе выбранного периода
+    df_raw_live = fetch_data(target_coin, "1m" if st.session_state.cfg['tf'] <= 60 else "5m", days_back=days_back)
+    if not df_raw_live.empty:
+        df_main = df_raw_live.set_index('ts').resample(f"{st.session_state.cfg['tf']}T").agg({
             'open':'first','high':'max','low':'min','close':'last','vol':'sum'
         }).dropna().reset_index()
         
@@ -162,7 +162,7 @@ with tab1:
             df = df.iloc[st.session_state.cfg['l']:]
             last = df.iloc[-1]
 
-            st.markdown(f"<div class='status-box'><h2 style='margin:0;'>{target_coin} | ТФ: {st.session_state.cfg['tf']}м</h2></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='status-box'><h2 style='margin:0;'>{target_coin} | ТФ: {st.session_state.cfg['tf']}м | История: {opt_period_label}</h2></div>", unsafe_allow_html=True)
             
             c1, c2, c3 = st.columns(3)
             c1.metric("Цена", f"{last['close']:.4f}")
@@ -171,17 +171,14 @@ with tab1:
 
             # --- ГРАФИК: ОБЛАКА НАД И ПОД (Professional Framing) ---
             fig = go.Figure()
-            # Верхнее облако (U1 - U2)
             fig.add_trace(go.Scatter(x=df['ts'], y=df['u1'], line=dict(width=0), showlegend=False))
-            fig.add_trace(go.Scatter(x=df['ts'], y=df['u2'], fill='tonexty', fillcolor='rgba(255,50,50,0.2)', name='Sell Zone', line=dict(width=0)))
-            # Нижнее облако (L1 - L2)
+            fig.add_trace(go.Scatter(x=df['ts'], y=df['u2'], fill='tonexty', fillcolor='rgba(255,50,50,0.25)', name='Sell Zone', line=dict(color='rgba(255,50,50,0.4)', width=1)))
             fig.add_trace(go.Scatter(x=df['ts'], y=df['l1'], line=dict(width=0), showlegend=False))
-            fig.add_trace(go.Scatter(x=df['ts'], y=df['l2'], fill='tonexty', fillcolor='rgba(50,255,150,0.2)', name='Buy Zone', line=dict(width=0)))
+            fig.add_trace(go.Scatter(x=df['ts'], y=df['l2'], fill='tonexty', fillcolor='rgba(50,255,150,0.25)', name='Buy Zone', line=dict(color='rgba(50,255,150,0.4)', width=1)))
             
             fig.add_trace(go.Candlestick(x=df['ts'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], increasing_line_color='#00ff96', decreasing_line_color='#ff3a3a', name='Price'))
-            fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], line=dict(color='#FFD700', width=1.5), name="Mean Line"))
+            fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], line=dict(color='#FFD700', width=2), name="Mean Line"))
 
-            # Фикс масштаба: фокус на последних 120 свечах
             view = df.tail(120)
             fig.update_layout(height=750, template="plotly_dark", xaxis_rangeslider_visible=False,
                 yaxis=dict(range=[view['low'].min()*0.99, view['high'].max()*1.01], side="right", gridcolor="#23282e"),
@@ -191,7 +188,7 @@ with tab1:
             st.subheader("📋 Таблица параметров (Уровни ордеров)")
             st.dataframe(df[['ts', 'l2', 'l1', 'ml', 'u1', 'u2', 'close']].tail(15), use_container_width=True)
         else:
-            st.error("IndexError fix: Мало данных для отрисовки. Попробуйте обновить оптимизацию.")
+            st.error("IndexError fix: Мало данных для отрисовки за выбранный период.")
 
 with tab2:
     st.header("🎯 Рыночный Скринер")

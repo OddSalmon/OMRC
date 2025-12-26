@@ -187,4 +187,41 @@ if not data.empty and len(data) > st.session_state.p['l']:
     fig = go.Figure()
     # Облака
     fig.add_trace(go.Scatter(x=df['ts'], y=df['u2'], line=dict(width=0), showlegend=False))
-    fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], fill='tonexty', fill
+    fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], fill='tonexty', fillcolor='rgba(255,50,50,0.12)', name='Sell Zone'))
+    fig.add_trace(go.Scatter(x=df['ts'], y=df['l2'], fill='tonexty', fillcolor='rgba(50,255,150,0.12)', name='Buy Zone'))
+    
+    # Свечи
+    fig.add_trace(go.Candlestick(x=df['ts'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="Price"))
+    fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], line=dict(color='#FFD700', width=1.5), name="Mean Line"))
+
+    # Зум на цену (защита от сплющивания)
+    visible_df = df.tail(200)
+    y_min, y_max = visible_df['low'].min() * 0.98, visible_df['high'].max() * 1.02
+    
+    fig.update_layout(
+        height=650, template="plotly_dark", xaxis_rangeslider_visible=False,
+        yaxis=dict(range=[y_min, y_max], side="right", gridcolor="#23282e"),
+        margin=dict(l=0, r=0, t=10, b=0)
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 4. Сканер ТОП-50 (Краткий)
+    with st.expander("🔍 Быстрый сканер аномалий (TOP-50)"):
+        if st.button("Найти точки входа прямо сейчас"):
+            tokens = get_tokens()[:50]
+            scan_data = []
+            bar = st.progress(0)
+            for i, t in enumerate(tokens):
+                raw_s = fetch_safe(t, tf)
+                if not raw_s.empty and len(raw_s) > st.session_state.p['l']:
+                    df_s = calculate_mrc(raw_s, st.session_state.p['l'], st.session_state.p['m'])
+                    l_s = df_s.iloc[-1]
+                    if l_s['close'] >= l_s['u2'] or l_s['close'] <= l_s['l2']:
+                        res = "🔴 SELL" if l_s['close'] >= l_s['u2'] else "🟢 BUY"
+                        scan_data.append({"Asset": t, "Signal": res, "Price": l_s['close']})
+                bar.progress((i+1)/len(tokens))
+                time.sleep(0.05)
+            st.table(pd.DataFrame(scan_data))
+
+else:
+    st.warning("Ожидание данных от Hyperliquid API...")

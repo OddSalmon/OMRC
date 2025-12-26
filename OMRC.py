@@ -185,4 +185,13 @@ with tabs[1]:
                         results.append({
                             'Монета': token,
                             'Статус': status,
-                            'Volume (24h)': f"${row
+                            'Volume (24h)': f"${row.vol/1e6:.1f}M", # Форматируем в миллионы
+                            'Цена': round(l_s['close'], 4),
+                            'Stop-Loss': round(sl, 4),
+                            'Откл %': round((l_s['close']-l_s['ml'])/l_s['ml']*100, 2)
+                        })
+            bar.progress((i+1)/100)
+        
+        if results:
+            st.dataframe(pd.DataFrame(results).sort_values('Откл %', ascending=False), use_container_width=True)
+        else: st.info("Активных сигналов в ТОП-100 не найдено.")

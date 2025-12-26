@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import time
 
 # --- Инициализация и Стили ---
-st.set_page_config(page_title="MRC Hybrid Terminal v10.0", layout="wide")
+st.set_page_config(page_title="MRC Ultra-Optimizer v8.0", layout="wide")
 
 st.markdown("""
     <style>
@@ -21,14 +21,15 @@ st.markdown("""
 
 HL_URL = "https://api.hyperliquid.xyz/info"
 
-# --- Математическое Ядро ---
+# --- Математические функции ---
 def ss_filter(data, l):
     res = np.zeros_like(data)
     arg = np.sqrt(2) * np.pi / l
     a1, b1 = np.exp(-arg), 2 * np.exp(-arg) * np.cos(arg)
-    c1 = 1 - b1 + a1**2
+    c2, c3 = b1, -a1**2
+    c1 = 1 - c2 - c3
     for i in range(len(data)):
-        res[i] = c1*data[i] + b1*res[i-1] - (a1**2)*res[i-2] if i >= 2 else data[i]
+        res[i] = c1*data[i] + c2*res[i-1] + c3*res[i-2] if i >= 2 else data[i]
     return res
 
 def calculate_mrc(df, length, mult):
@@ -43,7 +44,7 @@ def calculate_mrc(df, length, mult):
     df['l2'] = np.maximum(df['ml'] - (mr * np.pi * mult), 1e-8)
     return df
 
-# --- API и Данные ---
+# --- API и Ресемплинг ---
 @st.cache_data(ttl=600)
 def get_tokens():
     try:
@@ -51,115 +52,124 @@ def get_tokens():
         return sorted([a['name'] for a in r[0]['universe']])
     except: return ["BTC", "ETH", "SOL"]
 
-def fetch_hl_data(coin, interval, days=3):
-    start_ts = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-    payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "startTime": start_ts}}
+def fetch_1m_data(coin):
+    # Загружаем 5000 свечей (максимум для 1m)
+    start_ts = int((datetime.now() - timedelta(days=4)).timestamp() * 1000)
+    payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": start_ts}}
     try:
         r = requests.post(HL_URL, json=payload, timeout=15)
-        df = pd.DataFrame(r.json())
-        if df.empty: return df
+        if r.status_code != 200: return pd.DataFrame()
+        data = r.json()
+        if not data: return pd.DataFrame()
+        df = pd.DataFrame(data)
         df = df.rename(columns={'t':'ts','o':'open','h':'high','l':'low','c':'close','v':'vol'})
         for c in ['open','high','low','close','vol']: df[c] = df[c].astype(float)
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         return df
     except: return pd.DataFrame()
 
-# --- Логика Оптимизации (1-60 мин) ---
-def run_full_optimization(coin):
-    df_1m = fetch_hl_data(coin, "1m", days=4)
+# --- ГЛУБОКИЙ ОПТИМИЗАТОР (1-60 минут) ---
+def run_total_optimization(coin):
+    df_1m = fetch_1m_data(coin)
     if df_1m.empty: return None
     best_p = {"score": -1}
-    tfs = range(1, 61)
-    bar = st.progress(0)
-    for i, tf in enumerate(tfs):
-        df_tf = df_1m.set_index('ts').resample(f'{tf}T').agg({
-            'open':'first','high':'max','low':'min','close':'last','vol':'sum'
-        }).dropna().reset_index()
-        if len(df_tf) < 250: continue
-        for l in [150, 250]:
-            for m in [2.4, 2.8]:
-                df_mrc = calculate_mrc(df_tf.copy(), l, m)
-                last_slice = df_mrc.tail(200)
-                ob = last_slice[last_slice['high'] >= last_slice['u2']].index
-                os = last_slice[last_slice['low'] <= last_slice['l2']].index
-                total = len(ob) + len(os)
-                if total < 3: continue
-                # Упрощенный скоринг для скорости
-                score = total / (df_mrc['u2'].mean() - df_mrc['l2'].mean())
-                if score > best_p['score']:
-                    best_p = {"tf": tf, "l": l, "m": m, "score": score}
-        bar.progress((i+1)/len(tfs))
-    return best_p
+    tfs = range(1, 61) # Шаг в 1 минуту до часа
+    lengths = [150, 200, 250]
+    mults = [2.1, 2.4, 2.8]
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total_iterations = len(tfs) * len(lengths) * len(mults)
+    current_step = 0
 
-# --- Логика Мартингейл Бектеста ---
-def backtest_martingale(df):
-    balance, pos, entry, trades = 1000.0, 0.0, 0.0, []
-    pnl_path = [balance]
-    for i in range(1, len(df)):
-        row = df.iloc[i]
-        if pos == 0:
-            if row['low'] <= row['l2']:
-                entry, pos = row['l2'], 100.0 / row['l2']
-                trades.append({'ts':row['ts'], 'type':'BUY', 'price':entry})
-            elif row['high'] >= row['u2']:
-                entry, pos = row['u2'], -100.0 / row['u2']
-                trades.append({'ts':row['ts'], 'type':'SELL', 'price':entry})
-        else:
-            # Тейк на средней линии
-            if (pos > 0 and row['high'] >= row['ml']) or (pos < 0 and row['low'] <= row['ml']):
-                balance += pos * (row['ml'] - entry) if pos > 0 else abs(pos) * (entry - row['ml'])
-                trades.append({'ts':row['ts'], 'type':'EXIT', 'price':row['ml']})
-                pos = 0
-        pnl_path.append(balance)
-    df['balance'] = pnl_path
-    return df, trades
+    for tf in tfs:
+        df_tf = df_1m.set_index('ts').resample(f'{tf}T').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'vol': 'sum'
+        }).dropna().reset_index()
+        if len(df_tf) < 260: continue
+        for l in lengths:
+            for m in mults:
+                current_step += 1
+                df_mrc = calculate_mrc(df_tf.copy(), l, m)
+                test_slice = df_mrc.tail(250)
+                ob = test_slice[test_slice['high'] >= test_slice['u2']].index
+                os = test_slice[test_slice['low'] <= test_slice['l2']].index
+                all_sigs = list(ob) + list(os)
+                if len(all_sigs) < 4: continue
+                reversions, drawdowns = 0, []
+                for idx in all_sigs:
+                    future = df_mrc.loc[idx : idx + 10]
+                    if future.empty: continue
+                    if ((future['low'] <= future['ml']) & (future['high'] >= future['ml'])).any():
+                        reversions += 1
+                        mdd = (future['high'].max() - df_mrc.loc[idx, 'u2']) / df_mrc.loc[idx, 'u2'] if idx in ob else \
+                              (df_mrc.loc[idx, 'l2'] - future['low'].min()) / df_mrc.loc[idx, 'l2']
+                        drawdowns.append(max(0, mdd))
+                rev_rate = reversions / len(all_sigs)
+                avg_mdd = np.mean(drawdowns) if drawdowns else 0.5
+                score = (len(all_sigs) * rev_rate) / (avg_mdd + 0.01)
+                if score > best_p['score']:
+                    best_p = {"tf": tf, "l": l, "m": m, "score": score, "rev": rev_rate, "mdd": avg_mdd}
+        progress_bar.progress(current_step / total_iterations)
+        status_text.text(f"Оптимизация ТФ: {tf} мин...")
+    status_text.empty()
+    progress_bar.empty()
+    return best_p
 
 # --- UI Sidebar ---
 with st.sidebar:
-    st.header("🧬 MRC Терминал v10")
-    tokens = get_tokens()
-    coin = st.selectbox("Актив", tokens, index=tokens.index("BTC") if "BTC" in tokens else 0)
-    if 'cfg' not in st.session_state: st.session_state.cfg = {"tf": 60, "l": 200, "m": 2.4}
+    st.header("🧬 MRC Терминал v8.0")
+    all_tokens = get_tokens()
+    target_coin = st.selectbox("Актив", all_tokens, index=all_tokens.index("BTC") if "BTC" in all_tokens else 0)
+    if 'cfg' not in st.session_state: st.session_state.cfg = {"tf": 60, "l": 200, "m": 2.4, "rev": 0, "mdd": 0}
+    st.divider()
+    if st.button("🔥 ГЛУБОКИЙ ПОИСК (1-60 МИН)"):
+        with st.spinner(f"Поиск резонанса для {target_coin}..."):
+            best = run_total_optimization(target_coin)
+            if best:
+                st.session_state.cfg = best
+                st.success(f"Идеал найден: {best['tf']} мин!")
+            else: st.error("Данные недоступны.")
+    st.divider()
+    with st.expander("⚙️ Ручной подбор (Инфобокс)"):
+        st.info("💡 **Зачем это нужно?**\nАвто-поиск ищет лучшие параметры на истории. Ручные настройки нужны для адаптации к текущему моменту (например, расширить границы перед важными новостями).")
+        st.session_state.cfg['l'] = st.slider("Период", 50, 500, st.session_state.cfg['l'], 50)
+        st.session_state.cfg['m'] = st.slider("Множитель", 1.0, 4.0, st.session_state.cfg['m'], 0.1)
+
+# --- Основной экран ---
+df_1m = fetch_1m_data(target_coin)
+if not df_1m.empty:
+    df_main = df_1m.set_index('ts').resample(f"{st.session_state.cfg['tf']}T").agg({
+        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'vol': 'sum'
+    }).dropna().reset_index()
+    df = calculate_mrc(df_main, st.session_state.cfg['l'], st.session_state.cfg['m'])
     
-    if st.button("🔥 ГЛУБОКАЯ ОПТИМИЗАЦИЯ (1-60м)"):
-        res = run_full_optimization(coin)
-        if res: st.session_state.cfg = res; st.rerun()
-
-# --- Основные Вкладки ---
-tab1, tab2 = st.tabs(["📊 Терминал (Live)", "🧪 Бектест (Martingale)"])
-
-with tab1:
-    df_raw = fetch_hl_data(coin, "1m", days=4)
-    if not df_raw.empty:
-        df_tf = df_raw.set_index('ts').resample(f"{st.session_state.cfg['tf']}T").agg({
-            'open':'first','high':'max','low':'min','close':'last','vol':'sum'
-        }).dropna().reset_index()
-        df = calculate_mrc(df_tf, st.session_state.cfg['l'], st.session_state.cfg['m']).tail(200)
+    # ЗАЩИТА ОТ IndexError: проверяем, не пустой ли DF после расчетов
+    if not df.empty and len(df) > st.session_state.cfg['l']:
+        df = df.iloc[st.session_state.cfg['l']:]
         last = df.iloc[-1]
-        
-        st.metric("BTC Цена", f"{last['close']:.2f}", f"ТФ: {st.session_state.cfg['tf']}м")
-        
+        mdd_val = max(0.005, st.session_state.cfg['mdd'])
+        leverage = min(20, int(0.10 / mdd_val))
+
+        st.markdown(f"<div class='status-box'><h2 style='margin:0;'>{target_coin} | ТФ: {st.session_state.cfg['tf']} мин</h2></div>", unsafe_allow_html=True)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Цена", f"{last['close']:.4f}")
+        c2.metric("Вер. возврата", f"{st.session_state.cfg['rev']*100:.1f}%")
+        c3.metric("Ср. просадка", f"{st.session_state.cfg['mdd']*100:.2f}%")
+        c4.metric("Реком. Плечо", f"{leverage}x")
+
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df['ts'], y=df['u2'], line=dict(width=0), showlegend=False))
-        fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], fill='tonexty', fillcolor='rgba(255,50,50,0.1)', name='Sell Zone'))
-        fig.add_trace(go.Scatter(x=df['ts'], y=df['l2'], fill='tonexty', fillcolor='rgba(50,255,150,0.1)', name='Buy Zone'))
-        fig.add_trace(go.Candlestick(x=df['ts'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'))
-        fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig, use_container_width=True)
+        fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], fill='tonexty', fillcolor='rgba(255,50,50,0.12)', name='Sell Zone'))
+        fig.add_trace(go.Scatter(x=df['ts'], y=df['l2'], fill='tonexty', fillcolor='rgba(50,255,150,0.12)', name='Buy Zone'))
+        fig.add_trace(go.Candlestick(x=df['ts'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="Price"))
+        fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], line=dict(color='#FFD700', width=1.5), name="Mean Line"))
         
-        st.subheader("📋 Границы облаков")
-        st.dataframe(df[['ts', 'l2', 'ml', 'u2', 'close']].tail(10), use_container_width=True)
-
-with tab2:
-    st.header("Симуляция стратегии за месяц")
-    if st.button("Запустить бектест"):
-        data_bt = fetch_hl_data(coin, "15m", days=30)
-        if not data_bt.empty:
-            df_bt = calculate_mrc(data_bt, st.session_state.cfg['l'], st.session_state.cfg['m'])
-            res_df, trades = backtest_martingale(df_bt)
-            
-            st.metric("Итоговый баланс", f"${res_df['balance'].iloc[-1]:.2f}")
-            fig_pnl = go.Figure(go.Scatter(x=res_df['ts'], y=res_df['balance'], fill='tozeroy', name='Equity'))
-            fig_pnl.update_layout(height=400, template="plotly_dark", title="Кривая капитала")
-            st.plotly_chart(fig_pnl, use_container_width=True)
-            st.dataframe(pd.DataFrame(trades).tail(20))
+        view = df.tail(100)
+        fig.update_layout(height=700, template="plotly_dark", xaxis_rangeslider_visible=False,
+            yaxis=dict(range=[view['low'].min()*0.99, view['high'].max()*1.01], side="right"),
+            margin=dict(l=0, r=0, t=10, b=0), legend=dict(orientation="h", y=1.05))
+        st.plotly_chart(fig, use_container_width=True)
+        st.subheader("📋 Таблица границ облаков")
+        st.dataframe(df[['ts', 'l2', 'ml', 'u2', 'close']].tail(15), use_container_width=True)
+    else: st.error("Недостаточно данных для индикатора. Попробуйте другой ТФ или актив.")
+else: st.error("Ошибка API: Пустой ответ от Hyperliquid.")

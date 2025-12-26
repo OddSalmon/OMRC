@@ -4,24 +4,21 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-import time
 
-# --- Инициализация и Стили ---
-st.set_page_config(page_title="MRC Ultra-Optimizer v8.0", layout="wide")
+# --- Настройки ---
+st.set_page_config(page_title="MRC Martingale Backtester", layout="wide")
 
 st.markdown("""
     <style>
     .stApp { background-color: #0d1117; color: #c9d1d9; }
     .stMetric { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 15px; }
-    [data-testid="stMetricValue"] { color: #58a6ff !important; font-family: 'Courier New', monospace; }
     div.stButton > button { width: 100%; border-radius: 5px; height: 3.5em; background-color: #238636; color: white; font-weight: bold; }
-    .status-box { padding: 15px; border-radius: 10px; border-left: 5px solid #58a6ff; background-color: #161b22; margin-bottom: 20px; }
     </style>
 """, unsafe_allow_html=True)
 
 HL_URL = "https://api.hyperliquid.xyz/info"
 
-# --- Математические функции ---
+# --- Математика MRC ---
 def ss_filter(data, l):
     res = np.zeros_like(data)
     arg = np.sqrt(2) * np.pi / l
@@ -44,132 +41,148 @@ def calculate_mrc(df, length, mult):
     df['l2'] = np.maximum(df['ml'] - (mr * np.pi * mult), 1e-8)
     return df
 
-# --- API и Ресемплинг ---
-@st.cache_data(ttl=600)
-def get_tokens():
-    try:
-        r = requests.post(HL_URL, json={"type": "metaAndAssetCtxs"}).json()
-        return sorted([a['name'] for a in r[0]['universe']])
-    except: return ["BTC", "ETH", "SOL"]
-
-def fetch_1m_data(coin):
-    # Загружаем 5000 свечей (максимум для 1m)
-    start_ts = int((datetime.now() - timedelta(days=4)).timestamp() * 1000)
-    payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": start_ts}}
+# --- Загрузка данных (Месяц истории) ---
+def fetch_backtest_data(coin):
+    # Пытаемся забрать 5000 свечей (максимум API за один раз)
+    # Для ТФ 15м это около 52 дней истории
+    start_ts = int((datetime.now() - timedelta(days=31)).timestamp() * 1000)
+    payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": "15m", "startTime": start_ts}}
     try:
         r = requests.post(HL_URL, json=payload, timeout=15)
-        if r.status_code != 200: return pd.DataFrame()
-        data = r.json()
-        if not data: return pd.DataFrame()
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(r.json())
+        if df.empty: return df
         df = df.rename(columns={'t':'ts','o':'open','h':'high','l':'low','c':'close','v':'vol'})
-        for c in ['open','high','low','close','vol']: df[c] = df[c].astype(float)
+        for c in ['open','high','low','close']: df[c] = df[c].astype(float)
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         return df
     except: return pd.DataFrame()
 
-# --- ГЛУБОКИЙ ОПТИМИЗАТОР (1-60 минут) ---
-def run_total_optimization(coin):
-    df_1m = fetch_1m_data(coin)
-    if df_1m.empty: return None
-    best_p = {"score": -1}
-    tfs = range(1, 61) # Шаг в 1 минуту до часа
-    lengths = [150, 200, 250]
-    mults = [2.1, 2.4, 2.8]
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    total_iterations = len(tfs) * len(lengths) * len(mults)
-    current_step = 0
-
-    for tf in tfs:
-        df_tf = df_1m.set_index('ts').resample(f'{tf}T').agg({
-            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'vol': 'sum'
-        }).dropna().reset_index()
-        if len(df_tf) < 260: continue
-        for l in lengths:
-            for m in mults:
-                current_step += 1
-                df_mrc = calculate_mrc(df_tf.copy(), l, m)
-                test_slice = df_mrc.tail(250)
-                ob = test_slice[test_slice['high'] >= test_slice['u2']].index
-                os = test_slice[test_slice['low'] <= test_slice['l2']].index
-                all_sigs = list(ob) + list(os)
-                if len(all_sigs) < 4: continue
-                reversions, drawdowns = 0, []
-                for idx in all_sigs:
-                    future = df_mrc.loc[idx : idx + 10]
-                    if future.empty: continue
-                    if ((future['low'] <= future['ml']) & (future['high'] >= future['ml'])).any():
-                        reversions += 1
-                        mdd = (future['high'].max() - df_mrc.loc[idx, 'u2']) / df_mrc.loc[idx, 'u2'] if idx in ob else \
-                              (df_mrc.loc[idx, 'l2'] - future['low'].min()) / df_mrc.loc[idx, 'l2']
-                        drawdowns.append(max(0, mdd))
-                rev_rate = reversions / len(all_sigs)
-                avg_mdd = np.mean(drawdowns) if drawdowns else 0.5
-                score = (len(all_sigs) * rev_rate) / (avg_mdd + 0.01)
-                if score > best_p['score']:
-                    best_p = {"tf": tf, "l": l, "m": m, "score": score, "rev": rev_rate, "mdd": avg_mdd}
-        progress_bar.progress(current_step / total_iterations)
-        status_text.text(f"Оптимизация ТФ: {tf} мин...")
-    status_text.empty()
-    progress_bar.empty()
-    return best_p
-
-# --- UI Sidebar ---
-with st.sidebar:
-    st.header("🧬 MRC Терминал v8.0")
-    all_tokens = get_tokens()
-    target_coin = st.selectbox("Актив", all_tokens, index=all_tokens.index("BTC") if "BTC" in all_tokens else 0)
-    if 'cfg' not in st.session_state: st.session_state.cfg = {"tf": 60, "l": 200, "m": 2.4, "rev": 0, "mdd": 0}
-    st.divider()
-    if st.button("🔥 ГЛУБОКИЙ ПОИСК (1-60 МИН)"):
-        with st.spinner(f"Поиск резонанса для {target_coin}..."):
-            best = run_total_optimization(target_coin)
-            if best:
-                st.session_state.cfg = best
-                st.success(f"Идеал найден: {best['tf']} мин!")
-            else: st.error("Данные недоступны.")
-    st.divider()
-    with st.expander("⚙️ Ручной подбор (Инфобокс)"):
-        st.info("💡 **Зачем это нужно?**\nАвто-поиск ищет лучшие параметры на истории. Ручные настройки нужны для адаптации к текущему моменту (например, расширить границы перед важными новостями).")
-        st.session_state.cfg['l'] = st.slider("Период", 50, 500, st.session_state.cfg['l'], 50)
-        st.session_state.cfg['m'] = st.slider("Множитель", 1.0, 4.0, st.session_state.cfg['m'], 0.1)
-
-# --- Основной экран ---
-df_1m = fetch_1m_data(target_coin)
-if not df_1m.empty:
-    df_main = df_1m.set_index('ts').resample(f"{st.session_state.cfg['tf']}T").agg({
-        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'vol': 'sum'
-    }).dropna().reset_index()
-    df = calculate_mrc(df_main, st.session_state.cfg['l'], st.session_state.cfg['m'])
+# --- Логика Бектеста с Мартингейлом ---
+def run_martingale_backtest(df):
+    balance = 1000.0  # Начальный баланс $
+    position = 0.0    # Размер позиции в монетах
+    entry_price = 0.0
+    trades = []
+    pnl_history = [balance]
     
-    # ЗАЩИТА ОТ IndexError: проверяем, не пустой ли DF после расчетов
-    if not df.empty and len(df) > st.session_state.cfg['l']:
-        df = df.iloc[st.session_state.cfg['l']:]
-        last = df.iloc[-1]
-        mdd_val = max(0.005, st.session_state.cfg['mdd'])
-        leverage = min(20, int(0.10 / mdd_val))
-
-        st.markdown(f"<div class='status-box'><h2 style='margin:0;'>{target_coin} | ТФ: {st.session_state.cfg['tf']} мин</h2></div>", unsafe_allow_html=True)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Цена", f"{last['close']:.4f}")
-        c2.metric("Вер. возврата", f"{st.session_state.cfg['rev']*100:.1f}%")
-        c3.metric("Ср. просадка", f"{st.session_state.cfg['mdd']*100:.2f}%")
-        c4.metric("Реком. Плечо", f"{leverage}x")
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df['ts'], y=df['u2'], line=dict(width=0), showlegend=False))
-        fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], fill='tonexty', fillcolor='rgba(255,50,50,0.12)', name='Sell Zone'))
-        fig.add_trace(go.Scatter(x=df['ts'], y=df['l2'], fill='tonexty', fillcolor='rgba(50,255,150,0.12)', name='Buy Zone'))
-        fig.add_trace(go.Candlestick(x=df['ts'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="Price"))
-        fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], line=dict(color='#FFD700', width=1.5), name="Mean Line"))
+    in_position = False
+    side = None # "LONG" или "SHORT"
+    current_size = 100.0 # Базовая ставка в $
+    
+    for i in range(1, len(df)):
+        row = df.iloc[i]
         
-        view = df.tail(100)
-        fig.update_layout(height=700, template="plotly_dark", xaxis_rangeslider_visible=False,
-            yaxis=dict(range=[view['low'].min()*0.99, view['high'].max()*1.01], side="right"),
-            margin=dict(l=0, r=0, t=10, b=0), legend=dict(orientation="h", y=1.05))
-        st.plotly_chart(fig, use_container_width=True)
-        st.subheader("📋 Таблица границ облаков")
-        st.dataframe(df[['ts', 'l2', 'ml', 'u2', 'close']].tail(15), use_container_width=True)
-    else: st.error("Недостаточно данных для индикатора. Попробуйте другой ТФ или актив.")
-else: st.error("Ошибка API: Пустой ответ от Hyperliquid.")
+        if not in_position:
+            # Вход в LONG
+            if row['low'] <= row['l2']:
+                side = "LONG"
+                in_position = True
+                entry_price = row['l2']
+                position = current_size / entry_price
+                trades.append({'ts': row['ts'], 'type': 'BUY', 'price': entry_price})
+            
+            # Вход в SHORT
+            elif row['high'] >= row['u2']:
+                side = "SHORT"
+                in_position = True
+                entry_price = row['u2']
+                position = current_size / entry_price
+                trades.append({'ts': row['ts'], 'type': 'SELL', 'price': entry_price})
+        
+        else:
+            # Логика выхода (Mean Reversion)
+            if side == "LONG":
+                # Усреднение (Мартингейл) - если цена упала на 1.5% ниже входа
+                if row['low'] <= entry_price * 0.985:
+                    add_size = current_size * 2 # Удвоение
+                    position += add_size / row['low']
+                    entry_price = (entry_price * (position - add_size/row['low']) + row['low'] * (add_size/row['low'])) / position
+                    trades.append({'ts': row['ts'], 'type': 'MAR_BUY', 'price': row['low']})
+                
+                # Тейк-профит на средней линии
+                if row['high'] >= row['ml']:
+                    profit = (row['ml'] - entry_price) * position
+                    balance += profit
+                    trades.append({'ts': row['ts'], 'type': 'EXIT', 'price': row['ml']})
+                    in_position = False
+                    position = 0
+                    
+            elif side == "SHORT":
+                # Усреднение (Мартингейл) - если цена выросла на 1.5% выше входа
+                if row['high'] >= entry_price * 1.015:
+                    add_size = current_size * 2
+                    position += add_size / row['high']
+                    entry_price = (entry_price * (position - add_size/row['high']) + row['high'] * (add_size/row['high'])) / position
+                    trades.append({'ts': row['ts'], 'type': 'MAR_SELL', 'price': row['high']})
+                
+                # Тейк-профит на средней линии
+                if row['low'] <= row['ml']:
+                    profit = (entry_price - row['ml']) * position
+                    balance += profit
+                    trades.append({'ts': row['ts'], 'type': 'EXIT', 'price': row['ml']})
+                    in_position = False
+                    position = 0
+        
+        pnl_history.append(balance)
+        
+    df['balance'] = pnl_history
+    return df, trades
+
+# --- UI ---
+st.sidebar.header("📊 MRC Backtest Station")
+all_tokens = get_tokens() if 'get_tokens' in globals() else ["BTC", "ETH", "SOL"]
+coin = st.sidebar.selectbox("Актив", all_tokens, index=all_tokens.index("BTC") if "BTC" in all_tokens else 0)
+
+if st.sidebar.button("🚀 ЗАПУСТИТЬ БЕКТЕСТ (МЕСЯЦ)"):
+    with st.spinner("Загрузка данных и расчет стратегии..."):
+        df_raw = fetch_backtest_data(coin)
+        if not df_raw.empty:
+            # Оптимальные параметры (можно добавить ваш цикл оптимизации сюда)
+            df = calculate_mrc(df_raw, 200, 2.4)
+            df_res, trades = run_martingale_backtest(df)
+            
+            # Статистика
+            total_profit = df_res['balance'].iloc[-1] - 1000
+            st.subheader(f"Результаты бектеста за месяц: {coin}")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Чистая прибыль", f"${total_profit:.2f}")
+            c2.metric("Всего сделок", len([t for t in trades if t['type'] in ['BUY', 'SELL']]))
+            c3.metric("Усреднений (Мартин)", len([t for t in trades if 'MAR' in t['type']]))
+
+            # --- ГРАФИК БЕКТЕСТА ---
+            fig = go.Figure()
+            # Индикатор
+            fig.add_trace(go.Scatter(x=df_res['ts'], y=df_res['u2'], line=dict(color='rgba(255,0,0,0.2)'), name='Верхняя граница'))
+            fig.add_trace(go.Scatter(x=df_res['ts'], y=df_res['ml'], line=dict(color='gold', width=1), name='Средняя'))
+            fig.add_trace(go.Scatter(x=df_res['ts'], y=df_res['l2'], line=dict(color='rgba(0,255,0,0.2)'), name='Нижняя граница'))
+            
+            # Цена
+            fig.add_trace(go.Candlestick(x=df_res['ts'], open=df_res['open'], high=df_res['high'], low=df_res['low'], close=df_res['close'], name='Цена'))
+
+            # Маркеры сделок
+            for t in trades:
+                color = 'green' if 'BUY' in t['type'] else 'red' if 'SELL' in t['type'] else 'white'
+                symbol = 'triangle-up' if 'BUY' in t['type'] else 'triangle-down' if 'SELL' in t['type'] else 'x'
+                fig.add_trace(go.Scatter(x=[t['ts']], y=[t['price']], mode='markers', 
+                                         marker=dict(color=color, size=10, symbol=symbol), showlegend=False))
+
+            fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False, title="График входов и выходов (Мартингейл)")
+            st.plotly_chart(fig, use_container_width=True)
+
+            # --- ГРАФИК ДОХОДНОСТИ ---
+            fig_pnl = go.Figure()
+            fig_pnl.add_trace(go.Scatter(x=df_res['ts'], y=df_res['balance'], line=dict(color='#00ff96', width=2), fill='tozeroy', name='Баланс ($)'))
+            fig_pnl.update_layout(height=300, template="plotly_dark", title="Кривая капитала (Equity Curve)")
+            st.plotly_chart(fig_pnl, use_container_width=True)
+            
+            # Таблица сделок
+            st.subheader("Журнал сделок")
+            st.dataframe(pd.DataFrame(trades).tail(20), use_container_width=True)
+        else:
+            st.error("Ошибка загрузки данных.")
+else:
+    st.info("Выберите монету и нажмите кнопку для запуска бектеста.")
+
+def get_tokens(): # Упрощенная для примера
+    try: return sorted([a['name'] for a in requests.post(HL_URL, json={"type": "meta"}).json()['universe']])
+    except: return ["BTC", "ETH"]

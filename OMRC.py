@@ -57,16 +57,51 @@ def calculate_mrc(df, length, outer_mult, inner_mult=1.0):
 # --- API Функции ---
 def get_hl_candles(symbol, interval, limit=1000):
     url = "https://api.hyperliquid.xyz/info"
-    payload = {"type": "candleSnapshot", "req": {"coin": symbol, "interval": interval, "limit": limit}}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
+    }
+    payload = {
+        "type": "candleSnapshot",
+        "req": {
+            "coin": symbol,
+            "interval": interval,
+            "limit": limit
+        }
+    }
+    
     try:
-        res = requests.post(url, json=payload).json()
-        df = pd.DataFrame(res)
+        # Добавляем timeout, чтобы приложение не зависало
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        
+        # Проверяем статус ответа
+        if response.status_code != 200:
+            st.error(f"Ошибка API: Код {response.status_code} - {response.text}")
+            return pd.DataFrame()
+            
+        data = response.json()
+        
+        if not data:
+            st.warning(f"Данные для {symbol} на ТФ {interval} не найдены.")
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(data)
+        # Переименовываем колонки согласно ответу HL
         df = df.rename(columns={'t':'timestamp','o':'open','h':'high','l':'low','c':'close','v':'volume'})
-        for col in ['open','high','low','close']: df[col] = df[col].astype(float)
+        
+        for col in ['open','high','low','close','volume']:
+            df[col] = df[col].astype(float)
+            
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
-    except: return pd.DataFrame()
-
+        
+    except requests.exceptions.Timeout:
+        st.error("Превышено время ожидания (Timeout). Попробуйте VPN.")
+    except Exception as e:
+        st.error(f"Критическая ошибка подключения: {str(e)}")
+    
+    return pd.DataFrame()
+    
 # --- Визуализация (Красивый график) ---
 def plot_professional_chart(df, symbol, tf):
     fig = go.Figure()

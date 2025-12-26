@@ -5,8 +5,8 @@ import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- Стилизация ---
-st.set_page_config(page_title="MRC v13.1 | Turbo Stability", layout="wide")
+# --- Стили и Настройки ---
+st.set_page_config(page_title="MRC v13.3 | Total Isolation", layout="wide")
 
 st.markdown("""
     <style>
@@ -32,7 +32,7 @@ def ss_filter(data, l):
     return res
 
 def calculate_mrc(df, length, mult):
-    if len(df) < length + 10: return df # Запас для фильтра
+    if len(df) < length + 10: return df
     src = (df['high'] + df['low'] + df['close']) / 3
     tr = np.maximum(df['high'] - df['low'], 
                     np.maximum(abs(df['high'] - df['close'].shift(1)), 
@@ -62,30 +62,18 @@ def fetch_data_v8(coin):
         return df.drop_duplicates(subset='ts').sort_values('ts').tail(5000)
     except: return pd.DataFrame()
 
-# --- Turbo Optimization Task ---
+# --- Turbo Optimization Engine ---
 def check_tf_task(tf, df_1m):
-    df_tf = df_1m.set_index('ts').resample(f'{tf}T').agg({
-        'open':'first','high':'max','low':'min','close':'last'
-    }).dropna().reset_index()
-    
-    # Минимальный порог для корректного расчета MRC
+    df_tf = df_1m.set_index('ts').resample(f'{tf}T').agg({'open':'first','high':'max','low':'min','close':'last'}).dropna().reset_index()
     if len(df_tf) < 260: return None
-    
     best_sub = {"score": -1, "tf": tf}
     for l in [150, 200, 250]:
         for m in [2.1, 2.4, 2.8]:
             df_m = calculate_mrc(df_tf.copy(), l, m)
-            
-            # ЗАЩИТА: проверяем наличие колонки u2 перед доступом
             if 'u2' not in df_m.columns: continue
-            
             slice_df = df_m.tail(300)
-            ob_idx = slice_df[slice_df['high'] >= slice_df['u2']].index
-            os_idx = slice_df[slice_df['low'] <= slice_df['l2']].index
-            sigs = list(ob_idx) + list(os_idx)
-            
+            sigs = list(slice_df[slice_df['high'] >= slice_df['u2']].index) + list(slice_df[slice_df['low'] <= slice_df['l2']].index)
             if len(sigs) < 4: continue
-            
             reversions, ttr = 0, []
             for idx in sigs:
                 future = df_m.loc[idx : idx + 10]
@@ -94,7 +82,6 @@ def check_tf_task(tf, df_1m):
                     if row.low <= row.ml <= row.high:
                         reversions += 1; ttr.append(offset); found = True; break
                 if not found: ttr.append(20)
-            
             rev_rate = reversions / len(sigs)
             score = (rev_rate * np.sqrt(len(sigs))) / (np.mean(ttr) + 0.1)
             if score > best_sub['score']:
@@ -105,87 +92,103 @@ def run_turbo_optimization(coin):
     df_1m = fetch_data_v8(coin)
     if df_1m.empty: return None
     results = []
-    progress = st.progress(0)
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(check_tf_task, tf, df_1m): tf for tf in range(1, 61)}
-        for i, future in enumerate(as_completed(futures)):
-            try:
-                res = future.result()
-                if res and res['score'] > 0: results.append(res)
-            except: pass
-            progress.progress((i + 1) / 60)
-    progress.empty()
+        for future in as_completed(futures):
+            res = future.result()
+            if res: results.append(res)
     return max(results, key=lambda x: x['score']) if results else None
 
-# --- Sidebar ---
-if 'btc_tf' not in st.session_state: st.session_state.btc_tf = 15
-
+# --- UI Sidebar ---
 with st.sidebar:
-    st.header("🧬 Turbo V8 Terminal")
+    st.header("🧬 MRC Terminal v13.3")
     try:
         r = requests.post(HL_URL, json={"type": "metaAndAssetCtxs"}).json()
-        t_df = pd.DataFrame([{'name': a['name'], 'vol': float(c['dayNtlVlm'])} for a, c in zip(r[0]['universe'], r[1])]).sort_values(by='vol', ascending=False)
-        t_list = t_df['name'].tolist()
-    except: t_list = ["BTC", "HYPE"]
+        tokens_df = pd.DataFrame([{'name': a['name'], 'vol': float(c['dayNtlVlm'])} for a, c in zip(r[0]['universe'], r[1])]).sort_values(by='vol', ascending=False)
+        tokens_list = tokens_df['name'].tolist()
+    except: tokens_list = ["BTC", "HYPE", "ETH"]
     
-    target_coin = st.selectbox("Актив (Терминал)", t_list, index=0)
-    
-    if st.button("🚀 ТУРБО-ОПТИМИЗАЦИЯ BTC"):
-        res = run_turbo_optimization("BTC")
-        if res:
-            st.session_state.btc_tf = res['tf']
-            st.session_state.opt_res = res
-            st.success(f"Пульс BTC: {res['tf']}м")
+    selected_coin = st.selectbox("Выберите актив", tokens_list, index=0)
+    st.info("Терминал и Скринер теперь работают независимо.")
 
-# --- Tabs ---
-tab1, tab2 = st.tabs(["📊 Терминал", "🎯 Скринер ТОП-100"])
+# --- Вкладки ---
+tab1, tab2 = st.tabs(["📊 Терминал (Изолированный)", "🎯 Скринер (Индексный)"])
 
+# --- TAB 1: ТЕРМИНАЛ ---
 with tab1:
-    df_live = fetch_data_v8(target_coin)
-    if not df_live.empty:
-        df_tf = df_live.set_index('ts').resample(f"{st.session_state.btc_tf}T").agg({'open':'first','high':'max','low':'min','close':'last'}).dropna().reset_index()
-        cfg = st.session_state.get('opt_res', {"l": 200, "m": 2.4, "rev": 0, "ttr": 0, "sigs": 0})
-        df = calculate_mrc(df_tf, cfg['l'], cfg['m'])
-        
-        if not df.empty and 'u2' in df.columns:
+    if st.button(f"🔥 ИНДИВИДУАЛЬНЫЙ РАСЧЕТ {selected_coin}"):
+        with st.spinner(f"Оптимизация {selected_coin} (1-60 мин)..."):
+            res = run_turbo_optimization(selected_coin)
+            if res:
+                st.session_state[f"opt_{selected_coin}"] = res
+                st.success(f"Расчет для {selected_coin} готов!")
+
+    # Извлекаем данные именно для этой монеты
+    coin_cfg = st.session_state.get(f"opt_{selected_coin}")
+    
+    if coin_cfg:
+        df_raw = fetch_data_v8(selected_coin)
+        if not df_raw.empty:
+            df_tf = df_raw.set_index('ts').resample(f"{coin_cfg['tf']}T").agg({'open':'first','high':'max','low':'min','close':'last'}).dropna().reset_index()
+            df = calculate_mrc(df_tf, coin_cfg['l'], coin_cfg['m'])
             last = df.iloc[-1]
-            st.markdown(f"<div class='status-box'><h2 style='margin:0;'>{target_coin} | ТФ: {st.session_state.btc_tf}м</h2><span class='utc-info'>UTC Время. Актуальное в верхней строке.</span></div>", unsafe_allow_html=True)
+            
+            st.markdown(f"<div class='status-box'><h2 style='margin:0;'>{selected_coin} | ТФ: {coin_cfg['tf']}м</h2><span class='utc-info'>ДАННЫЕ ОСНОВАНЫ ТОЛЬКО НА ИСТОРИИ {selected_coin}</span></div>", unsafe_allow_html=True)
             
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Цена", f"{last['close']:.4f}")
-            c2.metric("Вер. возврата", f"{cfg.get('rev', 0)*100:.1f}%")
-            c3.metric("TTR (ср)", f"{int(cfg.get('ttr', 0) * st.session_state.btc_tf)} мин")
-            c4.metric("Сигналы", cfg.get('sigs', 0))
+            c2.metric("Вер. возврата", f"{coin_cfg['rev']*100:.1f}%")
+            c3.metric("TTR (ср)", f"{int(coin_cfg['ttr'] * coin_cfg['tf'])} мин")
+            c4.metric("Сигналы (V8)", coin_cfg['sigs'])
 
+            # Таблица свежее сверху
             display_df = df[['ts', 'sl_l', 'l2', 'l1', 'ml', 'u1', 'u2', 'sl_u', 'close']].tail(20).iloc[::-1].copy()
             display_df.columns = ['Время (UTC)', 'STOP (Long)', 'LIMIT (Long S2)', 'ZONE (Long S1)', 'TARGET (Mean)', 'ZONE (Short R1)', 'LIMIT (Short R2)', 'STOP (Short)', 'Цена']
             st.dataframe(display_df.style.format(precision=4), use_container_width=True)
-        else:
-            st.warning("Нажмите кнопку оптимизации BTC для корректного отображения.")
+    else:
+        st.info(f"Нажмите кнопку выше, чтобы запустить индивидуальный расчет для {selected_coin}")
 
+# --- TAB 2: СКРИНЕР ---
 with tab2:
-    st.header(f"🎯 Скринер ТОП-100 (ТФ BTC: {st.session_state.btc_tf}м)")
-    if st.button("🚀 МНОГОПОТОЧНЫЙ СКАН"):
-        results_scan = []
-        bar = st.progress(0)
-        def scan_task(t_name, vol):
-            df_s = fetch_data_v8(t_name)
-            if df_s.empty: return None
-            df_tf_s = df_s.set_index('ts').resample(f"{st.session_state.btc_tf}T").agg({'close':'last','high':'max','low':'min','open':'first'}).dropna().reset_index()
-            if len(df_tf_s) < 200: return None
-            df_m = calculate_mrc(df_tf_s, 200, 2.4)
-            if 'u2' not in df_m.columns: return None
-            l_s = df_m.iloc[-1]
-            if l_s['close'] >= l_s['u2']: return {'Asset': t_name, 'Status': '🔴 SELL', 'Vol': f"${vol/1e6:.1f}M", 'Dist %': (l_s['close']-l_s['ml'])/l_s['ml']*100}
-            if l_s['close'] <= l_s['l2']: return {'Asset': t_name, 'Status': '🟢 BUY', 'Dist %': (l_s['ml']-l_s['close'])/l_s['close']*100}
-            return None
+    st.header("🎯 Скринер ТОП-100 по Индексу")
+    
+    if st.button("🚀 РАССЧИТАТЬ ИНДЕКС (BTC) + СКАН"):
+        with st.spinner("1. Оптимизация BTC..."):
+            btc_res = run_turbo_optimization("BTC")
+            if btc_res:
+                st.session_state.index_tf = btc_res['tf']
+                st.write(f"✅ Индекс рынка найден: **{btc_res['tf']} мин** (по BTC)")
+                
+                with st.spinner("2. Многопоточный скан ТОП-100..."):
+                    results_scan = []
+                    bar = st.progress(0)
+                    
+                    def scan_task(t_name, vol, tf):
+                        df_s = fetch_data_v8(t_name)
+                        if df_s.empty: return None
+                        df_tf_s = df_s.set_index('ts').resample(f"{tf}T").agg({'close':'last','high':'max','low':'min','open':'first'}).dropna().reset_index()
+                        if len(df_tf_s) < 200: return None
+                        df_m = calculate_mrc(df_tf_s, 200, 2.4)
+                        if 'u2' not in df_m.columns: return None
+                        l_s = df_m.iloc[-1]
+                        if l_s['close'] >= l_s['u2']: return {'Asset': t_name, 'Status': '🔴 SELL', 'Vol': f"${vol/1e6:.1f}M", 'Откл %': (l_s['close']-l_s['ml'])/l_s['ml']*100}
+                        if l_s['close'] <= l_s['l2']: return {'Asset': t_name, 'Status': '🟢 BUY', 'Откл %': (l_s['ml']-l_s['close'])/l_s['close']*100}
+                        return None
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            f_to_s = {executor.submit(scan_task, row.name, row.vol): row.name for row in t_df.head(100).itertuples()}
-            for i, f in enumerate(as_completed(f_to_s)):
-                res_s = f.result()
-                if res_s: results_scan.append(res_s)
-                bar.progress((i+1)/100)
-        if results_scan:
-            st.dataframe(pd.DataFrame(results_scan).sort_values('Dist %', ascending=False), use_container_width=True)
-        else: st.info("Активных сигналов нет.")
+                    with ThreadPoolExecutor(max_workers=10) as executor:
+                        f_to_s = {executor.submit(scan_task, row.name, row.vol, btc_res['tf']): row.name for row in tokens_df.head(100).itertuples()}
+                        for i, f in enumerate(as_completed(f_to_s)):
+                            r_s = f.result()
+                            if r_s: results_scan.append(r_s)
+                            bar.progress((i+1)/100)
+                    
+                    if results_scan:
+                        st.session_state.screener_results = pd.DataFrame(results_scan).sort_values('Откл %', ascending=False)
+                    else:
+                        st.session_state.screener_results = None
+                        st.info("Сигналов нет.")
+
+    # Вывод результатов скринера
+    if 'screener_results' in st.session_state and st.session_state.screener_results is not None:
+        st.subheader(f"Сигналы на ТФ {st.session_state.index_tf}м (Индекс BTC)")
+        st.dataframe(st.session_state.screener_results, use_container_width=True)

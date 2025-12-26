@@ -3,10 +3,9 @@ import pandas as pd
 import numpy as np
 import requests
 from datetime import datetime, timedelta
-import time
 
-# --- Настройки и Стили ---
-st.set_page_config(page_title="MRC v11.4 | Position & Risk", layout="wide")
+# --- Инициализация ---
+st.set_page_config(page_title="MRC v11.5 | Stable Terminal", layout="wide")
 
 st.markdown("""
     <style>
@@ -15,13 +14,12 @@ st.markdown("""
     [data-testid="stMetricValue"] { color: #58a6ff !important; font-family: 'Courier New', monospace; }
     div.stButton > button { width: 100%; border-radius: 5px; height: 3.5em; background-color: #238636; color: white; font-weight: bold; }
     .status-box { padding: 15px; border-radius: 10px; border-left: 5px solid #58a6ff; background-color: #161b22; margin-bottom: 20px; }
-    .table-info { font-size: 0.9rem; color: #8b949e; margin-top: 10px; border-top: 1px solid #30363d; padding-top: 10px; }
     </style>
 """, unsafe_allow_html=True)
 
 HL_URL = "https://api.hyperliquid.xyz/info"
 
-# --- Математическое ядро ---
+# --- Математика V8 (Stable) ---
 def ss_filter(data, l):
     res = np.zeros_like(data)
     arg = np.sqrt(2) * np.pi / l
@@ -41,21 +39,20 @@ def calculate_mrc(df, length, mult):
     df['ml'] = ss_filter(src.values, length)
     mr = ss_filter(tr.values, length)
     
-    # Основные границы
     df['u2'] = df['ml'] + (mr * np.pi * mult)
     df['l2'] = np.maximum(df['ml'] - (mr * np.pi * mult), 1e-8)
     df['u1'] = df['ml'] + (mr * np.pi * 1.0)
     df['l1'] = np.maximum(df['ml'] - (mr * np.pi * 1.0), 1e-8)
     
-    # Расчет Stop-Loss (Выносим за U2/L2 на 25% от ширины канала)
+    # Стоп-лосс: +25% от ширины канала за границы S2/R2
     buffer = (df['u2'] - df['ml']) * 0.25
     df['sl_u'] = df['u2'] + buffer
     df['sl_l'] = np.maximum(df['l2'] - buffer, 1e-8)
-    
     return df
 
-# --- API Модуль (V8 Fixed 5000) ---
+# --- API (V8 Fixed 5000) ---
 def fetch_data_v8(coin):
+    """Всегда 5000 свечей для точности оптимизации V8"""
     start_ts = int((datetime.now() - timedelta(days=4)).timestamp() * 1000)
     payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": start_ts}}
     try:
@@ -68,17 +65,20 @@ def fetch_data_v8(coin):
         return df.drop_duplicates(subset='ts').sort_values('ts').tail(5000)
     except: return pd.DataFrame()
 
-# --- Оптимизатор V8.0 ---
+# --- Оптимизатор V8.0 (1-60 мин) ---
 def run_v8_optimization(coin):
     df_1m = fetch_data_v8(coin)
     if df_1m.empty: return None
 
     best = {"score": -1}
-    tfs = range(1, 61) # Полный перебор 1-60 минут
+    tfs = range(1, 61) # Полный перебор как в V8
     progress = st.progress(0)
     
     for tf in tfs:
-        df_tf = df_1m.set_index('ts').resample(f'{tf}T').agg({'open':'first','high':'max','low':'min','close':'last'}).dropna().reset_index()
+        df_tf = df_1m.set_index('ts').resample(f'{tf}T').agg({
+            'open':'first','high':'max','low':'min','close':'last'
+        }).dropna().reset_index()
+        
         if len(df_tf) < 260: continue
         
         for l in [150, 200, 250]:
@@ -116,9 +116,9 @@ def run_v8_optimization(coin):
     progress.empty()
     return best
 
-# --- Sidebar ---
+# --- UI Sidebar ---
 with st.sidebar:
-    st.header("🧬 MRC Terminal v11.4")
+    st.header("🧬 MRC Terminal v11.5")
     try:
         r = requests.post(HL_URL, json={"type": "metaAndAssetCtxs"}).json()
         tokens = sorted([a['name'] for a in r[0]['universe']])
@@ -130,8 +130,8 @@ with st.sidebar:
         st.session_state.cfg = {"tf": 60, "l": 200, "m": 2.4, "rev": 0, "ttr": 0, "sigs": 0}
 
     st.divider()
-    if st.button("🔥 ОПТИМИЗИРОВАТЬ (ENGINE V8.0)"):
-        with st.spinner("Глубокий поиск..."):
+    if st.button("🔥 ОПТИМИЗИРОВАТЬ (V8 ENGINE)"):
+        with st.spinner("Глубокий поиск рыночного резонанса..."):
             res = run_v8_optimization(target_coin)
             if res: 
                 st.session_state.cfg = res
@@ -141,7 +141,7 @@ with st.sidebar:
     if st.button("🔍 ПЕРЕЙТИ К СКРИНЕРУ"):
         st.session_state.active_tab = "🎯 Скринер"
 
-# --- Main Tabs ---
+# --- Tabs ---
 tab1, tab2 = st.tabs(["📊 Терминал", "🎯 Скринер"])
 
 with tab1:
@@ -158,36 +158,23 @@ with tab1:
             st.markdown(f"<div class='status-box'><h2 style='margin:0;'>{target_coin} | ТФ: {st.session_state.cfg['tf']}м</h2></div>", unsafe_allow_html=True)
             
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Текущая цена", f"{last['close']:.4f}")
+            c1.metric("Цена", f"{last['close']:.4f}")
             c2.metric("Вероятность возврата", f"{st.session_state.cfg['rev']*100:.1f}%")
-            c3.metric("Ср. время возврата", f"{int(st.session_state.cfg['ttr'] * st.session_state.cfg['tf'])} мин")
-            c4.metric("Сигналов (V8 база)", st.session_state.cfg['sigs'])
+            c3.metric("Время возврата (ср)", f"{int(st.session_state.cfg['ttr'] * st.session_state.cfg['tf'])} мин")
+            c4.metric("Сигналов (V8)", st.session_state.cfg['sigs'])
 
-            st.subheader("📋 Таблица ценовых уровней и Риск-менеджмента")
-            
-            # Подготовка таблицы с уровнями Stop-Loss
+            st.subheader("📋 Таблица ценовых уровней")
+            # Исправленное отображение без использования matplotlib
             display_df = df[['ts', 'sl_l', 'l2', 'l1', 'ml', 'u1', 'u2', 'sl_u', 'close']].tail(15).copy()
-            display_df.columns = [
-                'Время', 'STOP (Buy)', 'LIMIT (Buy S2)', 'ENTRY (S1)', 
-                'TARGET (Mean)', 'ENTRY (R1)', 'LIMIT (Sell R2)', 'STOP (Sell)', 'Цена'
-            ]
-            st.dataframe(display_df.style.format(precision=4).background_gradient(subset=['STOP (Buy)', 'LIMIT (Buy S2)'], cmap='Greens').background_gradient(subset=['LIMIT (Sell R2)', 'STOP (Sell)'], cmap='Reds'), use_container_width=True)
+            display_df.columns = ['Время', 'STOP Buy', 'LIMIT S2', 'ENTRY S1', 'TARGET Mean', 'ENTRY R1', 'LIMIT R2', 'STOP Sell', 'Цена']
             
-            # Расчет риска в % для текущей ситуации
-            sl_buy_dist = abs(last['l2'] - last['sl_l']) / last['l2'] * 100
-            sl_sell_dist = abs(last['sl_u'] - last['u2']) / last['u2'] * 100
-            
-            st.markdown(f"""
-            <div class='table-info'>
-            <b>Риск-параметры для {target_coin}:</b><br>
-            • <b>Расстояние до Stop-Loss:</b> ~{sl_buy_dist:.2f}% от точки входа S2.<br>
-            • <b>Рекомендация:</b> Если цена пересекает <b>STOP</b> уровень, математическое преимущество возврата считается утраченным.<br>
-            • <b>Take Profit:</b> Всегда устанавливайте на уровне <b>TARGET (Mean)</b>.
-            </div>
-            """, unsafe_allow_html=True)
+            # Чистое форматирование без градиентов для стабильности
+            st.dataframe(display_df.style.format(precision=4), use_container_width=True)
+        else:
+            st.warning("Требуется оптимизация актива.")
 
 with tab2:
-    st.header("🎯 Скринер сигналов ТОП-50")
+    st.header("🎯 Скринер ТОП-50")
     if st.button("🚀 ЗАПУСТИТЬ ПЕРЕСЧЕТ РЫНКА"):
         results = []
         bar = st.progress(0)
@@ -222,4 +209,4 @@ with tab2:
         if results:
             st.dataframe(pd.DataFrame(results).sort_values('Откл %', ascending=False), use_container_width=True)
         else:
-            st.info("Экстремальных сигналов не найдено.")
+            st.info("Сигналов не найдено.")

@@ -4,8 +4,8 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 
-# --- Инициализация и Стили ---
-st.set_page_config(page_title="MRC v11.8 | Volume & Liquidity", layout="wide")
+# --- Инициализация терминала ---
+st.set_page_config(page_title="MRC v11.9 | Classic Power", layout="wide")
 
 st.markdown("""
     <style>
@@ -20,7 +20,7 @@ st.markdown("""
 
 HL_URL = "https://api.hyperliquid.xyz/info"
 
-# --- Математическое ядро ---
+# --- Математическое ядро (V8 Original) ---
 def ss_filter(data, l):
     res = np.zeros_like(data)
     arg = np.sqrt(2) * np.pi / l
@@ -39,6 +39,7 @@ def calculate_mrc(df, length, mult):
                                abs(df['low'] - df['close'].shift(1)))).fillna(0)
     df['ml'] = ss_filter(src.values, length)
     mr = ss_filter(tr.values, length)
+    # Границы
     df['u2'] = df['ml'] + (mr * np.pi * mult)
     df['l2'] = np.maximum(df['ml'] - (mr * np.pi * mult), 1e-8)
     df['u1'] = df['ml'] + (mr * np.pi * 1.0)
@@ -50,23 +51,16 @@ def calculate_mrc(df, length, mult):
     return df
 
 # --- API Модуль ---
-def get_tokens_with_volume():
-    """Получает токены и их 24ч объем"""
+def get_tokens_and_volumes():
     try:
         res = requests.post(HL_URL, json={"type": "metaAndAssetCtxs"}).json()
-        # Сопоставляем имена активов с их контекстом (где лежит объем)
-        universe = res[0]['universe']
-        ctxs = res[1]
-        data = []
-        for i, asset in enumerate(universe):
-            data.append({
-                'name': asset['name'],
-                'vol': float(ctxs[i]['dayNtlVlm']) # 24h Notional Volume
-            })
+        universe, ctxs = res[0]['universe'], res[1]
+        data = [{'name': a['name'], 'vol': float(c['dayNtlVlm'])} for i, (a, c) in enumerate(zip(universe, ctxs))]
         return pd.DataFrame(data).sort_values(by='vol', ascending=False)
     except: return pd.DataFrame(columns=['name', 'vol'])
 
 def fetch_data_v8(coin):
+    # Классические 5000 свечей для V8
     start_ts = int((datetime.now() - timedelta(days=4)).timestamp() * 1000)
     payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": start_ts}}
     try:
@@ -79,7 +73,7 @@ def fetch_data_v8(coin):
         return df.drop_duplicates(subset='ts').sort_values('ts').tail(5000)
     except: return pd.DataFrame()
 
-# --- Оптимизатор V8.0 ---
+# --- Оптимизатор V8.0 (Классический перебор 1-60) ---
 def run_v8_optimization(coin):
     df_1m = fetch_data_v8(coin)
     if df_1m.empty: return None
@@ -96,14 +90,13 @@ def run_v8_optimization(coin):
                 if len(sigs) < 4: continue
                 reversions, ttr = 0, []
                 for idx in sigs:
-                    future = df_m.loc[idx : idx + 20]
+                    future = df_m.loc[idx : idx + 10] # Возврат за 10 свечей как в V8
                     found = False
                     for offset, row in enumerate(future.itertuples()):
                         if row.low <= row.ml <= row.high:
                             reversions += 1; ttr.append(offset); found = True; break
                     if not found: ttr.append(20)
                 rev_rate = reversions / len(sigs)
-                # Score formula
                 score = (rev_rate * np.sqrt(len(sigs))) / (np.mean(ttr) + 0.1)
                 if score > best['score']:
                     best = {"tf": tf, "l": l, "m": m, "score": score, "rev": rev_rate, "ttr": np.mean(ttr), "sigs": len(sigs)}
@@ -111,29 +104,26 @@ def run_v8_optimization(coin):
     progress.empty()
     return best
 
-# --- UI Sidebar ---
-if 'auto_scan' not in st.session_state: st.session_state.auto_scan = False
-
+# --- Sidebar ---
 with st.sidebar:
-    st.header("🧬 MRC Terminal v11.8")
-    tokens_df = get_tokens_with_volume()
+    st.header("🧬 MRC Terminal v11.9")
+    tokens_df = get_tokens_with_volume() if 'get_tokens_with_volume' in globals() else get_tokens_and_volumes()
     tokens_list = tokens_df['name'].tolist()
     target_coin = st.selectbox("Актив", tokens_list, index=tokens_list.index("BTC") if "BTC" in tokens_list else 0)
     
     if 'cfg' not in st.session_state:
         st.session_state.cfg = {"tf": 60, "l": 200, "m": 2.4, "rev": 0, "ttr": 0, "sigs": 0}
 
-    if st.button("🔥 ОПТИМИЗИРОВАТЬ (ENGINE V8)"):
-        res = run_v8_optimization(target_coin)
-        if res: st.session_state.cfg = res; st.success(f"Идеал: {res['tf']}м")
+    if st.button("🔥 ОПТИМИЗИРОВАТЬ (V8 ENGINE)"):
+        with st.spinner("Глубокий поиск рыночного резонанса..."):
+            res = run_v8_optimization(target_coin)
+            if res: st.session_state.cfg = res; st.success(f"Идеал: {res['tf']}м")
 
     st.divider()
-    if st.button("🔍 СКАНЕР РЫНКА (ТОП-100)"):
-        st.session_state.auto_scan = True
-        st.info("Перейдите во вкладку 'Скринер'.")
+    st.info("💡 Нажмите кнопку во вкладке Скринер для анализа ТОП-100.")
 
-# --- Tabs ---
-tabs = st.tabs(["📊 Терминал", "🎯 Скринер ТОП-100"])
+# --- Вкладки ---
+tabs = st.tabs(["📊 Терминал (Актуальное сверху)", "🎯 Скринер ТОП-100"])
 
 with tabs[0]:
     df_live = fetch_data_v8(target_coin)
@@ -142,16 +132,16 @@ with tabs[0]:
         df = calculate_mrc(df_tf, st.session_state.cfg['l'], st.session_state.cfg['m'])
         last = df.iloc[-1]
         
-        st.markdown(f"<div class='status-box'><h2 style='margin:0;'>{target_coin} | ТФ: {st.session_state.cfg['tf']}м</h2><span class='utc-info'>Время: UTC (Биржевой стандарт)</span></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='status-box'><h2 style='margin:0;'>{target_coin} | ТФ: {st.session_state.cfg['tf']}м</h2><span class='utc-info'>Текущее время в таблице: UTC (Биржевой стандарт)</span></div>", unsafe_allow_html=True)
         
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Текущая цена", f"{last['close']:.4f}")
+        c1.metric("Цена", f"{last['close']:.4f}")
         c2.metric("Вероятность", f"{st.session_state.cfg['rev']*100:.1f}%")
         c3.metric("TTR (ср)", f"{int(st.session_state.cfg['ttr'] * st.session_state.cfg['tf'])} мин")
         c4.metric("Сигналов", st.session_state.cfg['sigs'])
 
-        st.subheader("📋 Таблица исполнения (Актуальное сверху)")
-        # Реверс таблицы
+        st.subheader("📋 Таблица исполнения сделок")
+        # Реверс таблицы (самое новое сверху)
         display_df = df[['ts', 'sl_l', 'l2', 'l1', 'ml', 'u1', 'u2', 'sl_u', 'close']].tail(20).iloc[::-1].copy()
         display_df.columns = [
             'Время (UTC)', 'STOP (Long)', 'LIMIT (Long Entry)', 'ZONE (Long Start)', 
@@ -160,38 +150,38 @@ with tabs[0]:
         st.dataframe(display_df.style.format(precision=4), use_container_width=True)
 
 with tabs[1]:
-    st.header("🎯 Скринер сигналов ТОП-100 по объему")
-    if st.button("🚀 ЗАПУСТИТЬ ПЕРЕСЧЕТ РЫНКА") or st.session_state.auto_scan:
-        st.session_state.auto_scan = False
+    st.header("🎯 Скринер ТОП-100 (Классический поиск)")
+    if st.button("🚀 ЗАПУСТИТЬ СКАНЕР ТОП-100"):
         results = []
         bar = st.progress(0)
-        # Берем ТОП-100 по объему из нашего DataFrame
         top_100_data = tokens_df.head(100)
         
         for i, row in enumerate(top_100_data.itertuples()):
             token = row.name
+            # Упрощенная загрузка для скринера для скорости
             df_s = fetch_data_v8(token)
             if not df_s.empty:
+                # Используем текущий найденный ТФ для скрининга всего рынка
                 df_s_tf = df_s.set_index('ts').resample(f"{st.session_state.cfg['tf']}T").agg({'close':'last','high':'max','low':'min','open':'first'}).dropna().reset_index()
                 if len(df_s_tf) > st.session_state.cfg['l']:
                     df_s_tf = calculate_mrc(df_s_tf, st.session_state.cfg['l'], st.session_state.cfg['m'])
                     l_s = df_s_tf.iloc[-1]
+                    
+                    # КЛАССИЧЕСКАЯ ЛОГИКА СИГНАЛА: Цена за пределами облака u2/l2
                     status = "Нейтрально"
-                    sl = 0
-                    if l_s['close'] >= l_s['u2']: status = "🔴 SELL"; sl = l_s['sl_u']
-                    elif l_s['close'] <= l_s['l2']: status = "🟢 BUY"; sl = l_s['sl_l']
+                    if l_s['close'] >= l_s['u2']: status = "🔴 SELL"
+                    elif l_s['close'] <= l_s['l2']: status = "🟢 BUY"
                     
                     if status != "Нейтрально":
                         results.append({
                             'Монета': token,
-                            'Статус': status,
-                            'Volume (24h)': f"${row.vol/1e6:.1f}M", # Форматируем в миллионы
+                            'Сигнал': status,
+                            'Volume (24h)': f"${row.vol/1e6:.1f}M",
                             'Цена': round(l_s['close'], 4),
-                            'Stop-Loss': round(sl, 4),
                             'Откл %': round((l_s['close']-l_s['ml'])/l_s['ml']*100, 2)
                         })
             bar.progress((i+1)/100)
         
         if results:
             st.dataframe(pd.DataFrame(results).sort_values('Откл %', ascending=False), use_container_width=True)
-        else: st.info("Активных сигналов в ТОП-100 не найдено.")
+        else: st.info("Активных сигналов в ТОП-100 сейчас нет.")

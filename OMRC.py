@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Конфигурация интерфейса ---
-st.set_page_config(page_title="MRC v27.1 | Professional", layout="wide")
+st.set_page_config(page_title="MRC v28.0 | Scalable", layout="wide")
 
 st.markdown("""
     <style>
@@ -40,11 +40,10 @@ def ss_filter(data, l):
         res[i] = c1*data[i] + c2*res[i-1] + c3*res[i-2] if i >= 2 else data[i]
     return res
 
-def calculate_mrc_final(df, length, mult):
+def calculate_mrc_logic(df, length, mult):
     if len(df) < length + 50: return df
     src = (df['high'] + df['low'] + df['close']) / 3
     tr = np.maximum(df['high'] - df['low'], np.maximum(abs(df['high'] - df['close'].shift(1)), abs(df['low'] - df['close'].shift(1)))).fillna(0)
-    
     df['ml'] = ss_filter(src.values, length)
     mr = ss_filter(tr.values, length)
     df['u2'] = df['ml'] + (mr * np.pi * mult)
@@ -61,15 +60,15 @@ def calculate_mrc_final(df, length, mult):
     df['zscore'] = (df['close'] - df['ml']) / (df['close'].rolling(length).std() + 1e-9)
     return df
 
-# --- API Модуль ---
+# --- API и Кэшированная оптимизация ---
 @st.cache_data(ttl=600)
-def get_tokens_final(): # Исправлено название функции
+def get_tokens_list():
     try:
         r = requests.post(HL_URL, json={"type": "metaAndAssetCtxs"}).json()
         return pd.DataFrame([{'name': a['name'], 'vol': float(c['dayNtlVlm']), 'funding': float(c['funding'])} for a, c in zip(r[0]['universe'], r[1])]).sort_values(by='vol', ascending=False)
     except: return pd.DataFrame()
 
-def fetch_candles(coin):
+def fetch_history(coin):
     start_ts = int((datetime.now() - timedelta(days=4)).timestamp() * 1000)
     payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": start_ts}}
     try:
@@ -81,14 +80,14 @@ def fetch_candles(coin):
     except: return pd.DataFrame()
 
 @st.cache_data(ttl=600, show_spinner=False)
-def optimize_asset_final(coin):
-    df_1m = fetch_candles(coin)
+def run_full_optimization(coin):
+    df_1m = fetch_history(coin)
     if df_1m.empty: return None
     best = {"score": -1, "tf": 15}
     for tf in range(1, 61):
         df_tf = df_1m.set_index('ts').resample(f'{tf}T').agg({'open':'first','high':'max','low':'min','close':'last'}).dropna().reset_index()
         if len(df_tf) < 250: continue
-        df_m = calculate_mrc_final(df_tf, 200, 2.4)
+        df_m = calculate_mrc_logic(df_tf, 200, 2.4)
         slice_df = df_m.tail(300)
         sigs = list(slice_df[slice_df['high'] >= slice_df['u2']].index) + list(slice_df[slice_df['low'] <= slice_df['l2']].index)
         if len(sigs) < 2: continue
@@ -110,73 +109,89 @@ def optimize_asset_final(coin):
                     "status": status, "rsi": last['rsi'], "zscore": last['zscore'], "stoch": last['stoch_rsi']}
     return best
 
-# --- Глобальные данные ---
-tokens_df = get_tokens_final()
+# --- ИНТЕРФЕЙС ---
+tokens_df = get_tokens_list()
 tab1, tab2 = st.tabs(["🎯 РЫНОЧНЫЙ СКАНЕР", "🔍 ПОЛНЫЙ АНАЛИЗ"])
 
 # --- TAB 1: СКАНЕР ---
 with tab1:
-    c1, c2 = st.columns([4, 1])
-    with c1: st.subheader("Скрининг ТОП-20: Оптимизация резонанса")
-    with c2: 
-        if st.button("🔄 ОБНОВИТЬ КЭШ"):
-            st.cache_data.clear()
-            st.rerun()
+    st.subheader("Сканирование ликвидности: Оптимизация резонанса")
+    
+    # Кнопки выбора нагрузки
+    c1, c2, c3, c4, c5 = st.columns(5)
+    scan_counts = [10, 30, 50, 100, 120]
+    times = ["~20с", "~50с", "~1.5м", "~3м", "~4м"]
+    
+    target_count = None
+    for i, col in enumerate([c1, c2, c3, c4, c5]):
+        if col.button(f"TOP-{scan_counts[i]}\n({times[i]})"):
+            target_count = scan_counts[i]
 
-    if st.button("ЗАПУСТИТЬ СКАНИРОВАНИЕ"):
+    st.divider()
+    
+    if target_count:
         results = []
         bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Определяем список монет для текущего запуска
+        coins_to_scan = tokens_df['name'].head(target_count).tolist()
+        
+        # 10 потоков - баланс для Streamlit Cloud
         with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(optimize_asset_final, coin): coin for coin in tokens_df['name'].head(20).tolist()}
+            futures = {executor.submit(run_full_optimization, coin): coin for coin in coins_to_scan}
             for i, f in enumerate(as_completed(futures)):
                 r = f.result()
                 if r: 
                     results.append(r)
                     st.session_state[f"opt_{r['coin']}"] = r
-                bar.progress((i+1)/20)
+                bar.progress((i+1)/len(coins_to_scan))
+                status_text.text(f"Обработано: {i+1} из {len(coins_to_scan)} монет")
         
         if results:
             res_df = pd.DataFrame(results)
             res_df['alpha'] = res_df['rev'] * abs(res_df['zscore'])
             best_coin = res_df.sort_values('alpha', ascending=False).iloc[0]['coin']
             
-            st.info("**Пояснение:** tf — лучший ТФ; rev — вер. возврата; zscore — откл. от средней.")
+            st.success(f"Сканирование {target_count} монет завершено.")
             st.dataframe(res_df[['coin', 'tf', 'status', 'rev', 'zscore']].style.apply(
                 lambda x: ['background-color: rgba(251, 191, 36, 0.2)' if x.coin == best_coin else '' for _ in x], axis=1
             ), use_container_width=True)
 
+    if st.button("🔄 ПОЛНАЯ ОЧИСТКА КЭША РЫНКА"):
+        st.cache_data.clear()
+        st.rerun()
+
 # --- TAB 2: ПОЛНЫЙ АНАЛИЗ ---
 with tab2:
-    target_coin = st.selectbox("Актив для анализа", tokens_df['name'].tolist())
-    
-    if st.button(f"РАССЧИТАТЬ {target_coin}"):
-        with st.spinner("Выполняется расчет оптимального таймфрейма..."):
-            st.session_state[f"opt_{target_coin}"] = optimize_asset_final(target_coin)
+    target_coin = st.selectbox("Выберите актив", tokens_df['name'].tolist())
+    if st.button(f"ВЫПОЛНИТЬ РАСЧЕТ {target_coin}"):
+        st.session_state[f"opt_{target_coin}"] = run_full_optimization(target_coin)
 
     cfg = st.session_state.get(f"opt_{target_coin}")
     if cfg:
-        df_raw = fetch_candles(target_coin)
+        df_raw = fetch_history(target_coin)
         df_tf = df_raw.set_index('ts').resample(f"{cfg['tf']}T").agg({'open':'first','high':'max','low':'min','close':'last'}).dropna().reset_index()
-        df = calculate_mrc_final(df_tf, 200, 2.4)
+        df = calculate_mrc_logic(df_tf, 200, 2.4)
         last = df.iloc[-1]
         funding = tokens_df[tokens_df['name']==target_coin]['funding'].values[0]
 
-        st.write(f"### Анализ {target_coin} на подобраном ТФ: **{cfg['tf']}м**")
+        st.write(f"### Анализ {target_coin} | Подобраный ТФ: **{cfg['tf']}м**")
         
         m1, m2, m3, m4 = st.columns(4)
         with m1:
             rsi_desc = "Перепроданность" if last['rsi'] < 30 else "Перекупленность" if last['rsi'] > 70 else "Нейтрально"
             st.metric("RSI (14)", f"{last['rsi']:.1f}")
-            st.markdown(f"<div class='metric-subtext'><b>{rsi_desc}</b>. Значения <30 или >70 — лучшие точки входа.</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='metric-subtext'><b>{rsi_desc}</b>. Подтверждает истощение движения.</div>", unsafe_allow_html=True)
         with m2:
             st.metric("Z-Score", f"{last['zscore']:.2f}σ")
-            st.markdown(f"<div class='metric-subtext'><b>Отклонение</b>. Выше 2.0σ — математическая аномалия.</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='metric-subtext'><b>Отклонение</b>. Значения выше 2.0σ аномальны.</div>", unsafe_allow_html=True)
         with m3:
             st.metric("Stoch RSI", f"{last['stoch_rsi']*100:.1f}%")
-            st.markdown(f"<div class='metric-subtext'><b>Импульс</b>. Входите, когда линия выходит из 0% или 100%.</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='metric-subtext'><b>Разворот</b>. Сигнал на выходе из 0% или 100%.</div>", unsafe_allow_html=True)
         with m4:
             st.metric("Funding APR", f"{funding*24*365*100:.1f}%")
-            st.markdown(f"<div class='metric-subtext'>Стоимость удержания. <b>{'+' if funding > 0 else '-'}</b> сентимент.</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='metric-subtext'><b>Сентимент</b>. Стоимость удержания позиции.</div>", unsafe_allow_html=True)
 
         # Вердикт
         verdict = "НЕЙТРАЛЬНО"
@@ -187,7 +202,7 @@ with tab2:
         elif last['close'] >= last['u2'] and last['stoch_rsi'] > 0.8:
             verdict = "ПОДТВЕРЖДЕННЫЙ ШОРТ (MRC + STOCH)"
             v_color = "#2a1c1c"
-        st.markdown(f"<div class='verdict-box' style='background-color: {v_color}'>ВЕРДИКТ: {verdict}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='verdict-box' style='background-color: {v_color}'>ИТОГОВЫЙ ВЕРДИКТ: {verdict}</div>", unsafe_allow_html=True)
 
         st.divider()
 
@@ -197,7 +212,15 @@ with tab2:
             st.markdown(f"<div class='stop-card'><div class='level-label'>LONG STOP (ATR)</div><div style='color: #da3633; font-weight: bold;'>{last['l2'] - last['atr']:.4f}</div></div>", unsafe_allow_html=True)
 
         with cm:
-            st.markdown(f"<div class='target-card'><div style='color: #58a6ff; font-weight: bold;'>💎 TAKE PROFIT</div><div class='level-label'>TARGET (MEAN)</div><div class='level-price' style='color: #58a6ff;'>{last['ml']:.4f}</div><div class='level-label' style='margin-top:15px;'>СРЕДНЕЕ ОЖИДАНИЕ</div><div style='font-size: 1.2rem; font-weight: bold;'>~{int(cfg['ttr'] * cfg['tf'])} мин</div></div>", unsafe_allow_html=True)
+            st.markdown(f"""
+            <div class='target-card'>
+                <div style='color: #58a6ff; font-weight: bold;'>💎 TAKE PROFIT</div>
+                <div class='level-label'>TARGET (MEAN)</div>
+                <div class='level-price' style='color: #58a6ff;'>{last['ml']:.4f}</div>
+                <div class='level-label' style='margin-top:15px;'>СРЕДНЕЕ ОЖИДАНИЕ</div>
+                <div style='font-size: 1.2rem; font-weight: bold;'>~{int(cfg['ttr'] * cfg['tf'])} мин</div>
+            </div>
+            """, unsafe_allow_html=True)
 
         with cs:
             st.markdown(f"<div class='entry-card-short'><div class='level-label'>LIMIT SELL (U2)</div><div class='level-price'>{last['u2']:.4f}</div><div class='level-label'>SAFETY EXIT (R1)</div><div style='font-size: 1.1rem; font-weight: bold;'>{last['u1']:.4f}</div></div>", unsafe_allow_html=True)

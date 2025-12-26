@@ -4,201 +4,167 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import time
 
-# --- Настройки стиля ---
-st.set_page_config(page_title="MRC Terminal | HyperLiquid", layout="wide")
+# --- Константы API ---
+HL_INFO_URL = "https://api.hyperliquid.xyz/info"
+# Нативные таймфреймы, которые понимает сервер HL
+NATIVE_INTERVALS = ["1m", "5m", "15m", "1h", "4h", "1d"]
 
-# Кастомный CSS для "терминального" вида
-st.markdown("""
-    <style>
-    .main { background-color: #0e1117; }
-    .stMetric { background-color: #161b22; border: 1px solid #30363d; padding: 10px; border-radius: 10px; }
-    div[data-testid="stExpander"] { border: none; background-color: #161b22; }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- Математическое ядро (Pine Script -> Python) ---
-def supersmoother(src, length):
-    ss = np.zeros_like(src)
-    arg = np.sqrt(2) * np.pi / length
-    a1 = np.exp(-arg)
-    b1 = 2 * a1 * np.cos(arg)
-    c2 = b1
-    c3 = -a1**2
-    c1 = 1 - c2 - c3
-    for i in range(len(src)):
-        if i < 2: ss[i] = src[i]
-        else: ss[i] = c1 * src[i] + c2 * ss[i-1] + c3 * ss[i-2]
-    return ss
-
-def calculate_mrc(df, length, outer_mult, inner_mult=1.0):
-    if len(df) < length: return df
+def get_mrc_values(df, length, mult):
+    """Ядро расчетов MRC"""
     src = (df['high'] + df['low'] + df['close']) / 3
     tr = np.maximum(df['high'] - df['low'], 
                     np.maximum(abs(df['high'] - df['close'].shift(1)), 
                                abs(df['low'] - df['close'].shift(1)))).fillna(0)
     
-    mean_line = supersmoother(src.values, length)
-    mean_range = supersmoother(tr.values, length)
+    # SuperSmoother
+    def ss_filter(data, l):
+        res = np.zeros_like(data)
+        arg = np.sqrt(2) * np.pi / l
+        a1 = np.exp(-arg)
+        b1 = 2 * a1 * np.cos(arg)
+        c2, c3 = b1, -a1**2
+        c1 = 1 - c2 - c3
+        for i in range(len(data)):
+            res[i] = c1*data[i] + c2*res[i-1] + c3*res[i-2] if i >= 2 else data[i]
+        return res
+
+    ml = ss_filter(src.values, length)
+    mr = ss_filter(tr.values, length)
     
-    # Расчет полос
-    df['mean_line'] = mean_line
-    df['upper_2'] = mean_line + (mean_range * np.pi * outer_mult)
-    df['upper_1'] = mean_line + (mean_range * np.pi * inner_mult)
-    df['lower_1'] = mean_line - (mean_range * np.pi * inner_mult)
-    df['lower_2'] = mean_line - (mean_range * np.pi * outer_mult)
-    
-    # Дополнительные градиентные уровни для красоты "облаков"
-    df['upper_ext'] = df['upper_2'] + (mean_range * 0.5)
-    df['lower_ext'] = df['lower_2'] - (mean_range * 0.5)
-    
+    df['ml'] = ml
+    df['u2'] = ml + (mr * np.pi * mult)
+    df['l2'] = ml - (mr * np.pi * mult)
     return df
 
-# --- API Функции ---
-def get_hl_candles(symbol, interval, limit=1000):
-    url = "https://api.hyperliquid.xyz/info"
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
-    }
+def fetch_candles(symbol, interval, days_back=3):
+    """
+    Безопасный запрос к API. 
+    Если интервал не нативный, запрашиваем 1m для ресемплинга.
+    """
+    is_custom = interval not in NATIVE_INTERVALS
+    api_interval = "1m" if is_custom else interval
+    
+    # Расчет startTime (обязательно для candleSnapshot)
+    start_ts = int((datetime.now() - timedelta(days=days_back)).timestamp() * 1000)
+    
     payload = {
         "type": "candleSnapshot",
         "req": {
             "coin": symbol,
-            "interval": interval,
-            "limit": limit
+            "interval": api_interval,
+            "startTime": start_ts
         }
     }
     
     try:
-        # Добавляем timeout, чтобы приложение не зависало
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
-        
-        # Проверяем статус ответа
+        response = requests.post(HL_INFO_URL, json=payload, timeout=10)
         if response.status_code != 200:
-            st.error(f"Ошибка API: Код {response.status_code} - {response.text}")
             return pd.DataFrame()
-            
+        
         data = response.json()
-        
-        if not data:
-            st.warning(f"Данные для {symbol} на ТФ {interval} не найдены.")
-            return pd.DataFrame()
-            
         df = pd.DataFrame(data)
-        # Переименовываем колонки согласно ответу HL
-        df = df.rename(columns={'t':'timestamp','o':'open','h':'high','l':'low','c':'close','v':'volume'})
+        if df.empty: return df
         
-        for col in ['open','high','low','close','volume']:
-            df[col] = df[col].astype(float)
+        df = df.rename(columns={'t':'ts','o':'open','h':'high','l':'low','c':'close','v':'vol'})
+        for col in ['open','high','low','close']: df[col] = df[col].astype(float)
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+        
+        # Если интервал был кастомным (например '23m'), делаем ресемплинг
+        if is_custom:
+            df = df.set_index('ts').resample(f'{interval.replace("m","")}T').agg({
+                'open':'first', 'high':'max', 'low':'min', 'close':'last'
+            }).dropna().reset_index()
             
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
-        
-    except requests.exceptions.Timeout:
-        st.error("Превышено время ожидания (Timeout). Попробуйте VPN.")
-    except Exception as e:
-        st.error(f"Критическая ошибка подключения: {str(e)}")
+    except:
+        return pd.DataFrame()
+
+# --- UI Setup ---
+st.set_page_config(page_title="MRC Pro Terminal", layout="wide")
+st.markdown("<style>section[data-testid='stSidebar'] {width: 300px !important;}</style>", unsafe_allow_html=True)
+
+# Сайдбар управления
+with st.sidebar:
+    st.header("🎯 MRC Control")
+    # Динамический список монет
+    if 'coins' not in st.session_state:
+        meta = requests.post(HL_INFO_URL, json={"type": "meta"}).json()
+        st.session_state.coins = [u['name'] for u in meta['universe']]
     
-    return pd.DataFrame()
+    target_coin = st.selectbox("Asset", st.session_state.coins, index=0)
     
-# --- Визуализация (Красивый график) ---
-def plot_professional_chart(df, symbol, tf):
-    fig = go.Figure()
+    # Поле для ввода любого ТФ (нативного или кастомного)
+    tf = st.text_input("Timeframe (e.g. 1h, 15m, 23m)", value="1h")
+    
+    st.divider()
+    
+    # Кнопки действий
+    c1, c2 = columns = st.columns(2)
+    refresh = c1.button("🔄 Refresh")
+    optimize = c2.button("🚀 Optimize")
 
-    # 1. Облако Перекупленности (Красное)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['upper_ext'], line=dict(width=0), showlegend=False))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['upper_2'], fill='tonexty', 
-                             fillcolor='rgba(255, 70, 70, 0.2)', line=dict(width=0), name='Sell Zone'))
+# --- Основная логика ---
+if 'best_params' not in st.session_state:
+    st.session_state.best_params = {"len": 200, "mult": 2.415}
 
-    # 2. Облако Перепроданности (Зеленое)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['lower_2'], line=dict(width=0), showlegend=False))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['lower_ext'], fill='tonexty', 
-                             fillcolor='rgba(0, 255, 150, 0.2)', line=dict(width=0), name='Buy Zone'))
+if optimize:
+    with st.status("Глубокая оптимизация параметров...") as status:
+        # Пример быстрой сетки для оптимизации
+        raw_data = fetch_candles(target_coin, "1m", days_back=4)
+        best_s = -1
+        for l in [100, 200, 300]:
+            for m in [2.1, 2.4, 3.0]:
+                test_df = get_mrc_values(raw_data.copy(), l, m)
+                # Скоринг: количество возвратов к средней после касания границ
+                touches = ((test_df['high'] > test_df['u2']) | (test_df['low'] < test_df['l2'])).sum()
+                if touches > best_s:
+                    best_s = touches
+                    st.session_state.best_params = {"len": l, "mult": m}
+        status.update(label="Оптимизация завершена!", state="complete")
 
-    # 3. Внутренний канал (Облако между 1 и 2 уровнями)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['upper_1'], line=dict(color='rgba(255,255,255,0.1)', dash='dot'), name='Upper Inner'))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['lower_1'], line=dict(color='rgba(255,255,255,0.1)', dash='dot'), name='Lower Inner'))
+# Визуализация
+df = fetch_candles(target_coin, tf)
 
-    # 4. Свечи
-    fig.add_trace(go.Candlestick(
-        x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
-        increasing_line_color='#00ff96', decreasing_line_color='#ff3a3a',
-        increasing_fillcolor='#00ff96', decreasing_fillcolor='#ff3a3a', name='Price'
-    ))
-
-    # 5. Средняя линия (Mean)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['mean_line'], line=dict(color='#FFD700', width=2), name='Mean Line'))
-
-    # Настройка осей и темы
-    fig.update_layout(
-        height=700, template='plotly_dark',
-        paper_bgcolor='#0e1117', plot_bgcolor='#0e1117',
-        margin=dict(l=10, r=10, t=40, b=10),
-        xaxis=dict(showgrid=False, rangeslider=dict(visible=False)),
-        yaxis=dict(showgrid=True, gridcolor='#30363d', side='right'),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    return fig
-
-# --- Main App Logic ---
-st.sidebar.title("⚡ MRC TERMINAL")
-if 'tokens' not in st.session_state:
-    try:
-        data = requests.post("https://api.hyperliquid.xyz/info", json={"type": "metaAndAssetCtxs"}).json()
-        st.session_state['tokens'] = sorted([a['name'] for a in data[0]['universe']])
-    except: st.session_state['tokens'] = ["BTC", "ETH", "SOL"]
-
-# Выбор монеты и базового ТФ
-coin = st.sidebar.selectbox("Asset", st.session_state['tokens'])
-tf_choice = st.sidebar.selectbox("Quick TF", ["15m", "1h", "4h", "1d"], index=1)
-
-col_btns = st.sidebar.columns(2)
-btn_refresh = col_btns[0].button("⚡ Обновить", use_container_width=True)
-btn_opt = col_btns[1].button("🎯 Оптимизация", use_container_width=True)
-
-# Инициализация параметров
-if 'params' not in st.session_state:
-    st.session_state['params'] = {'length': 200, 'mult': 2.415, 'tf': tf_choice}
-
-# Логика Оптимизации (упрощенная для примера, но рабочая)
-if btn_opt:
-    with st.spinner("Deep Learning Optimization..."):
-        # Здесь может быть ваш код поиска лучшего ТФ из предыдущего ответа
-        # Для примера ставим "лучшие" параметры
-        st.session_state['params'] = {'length': 250, 'mult': 2.8, 'tf': tf_choice}
-
-# Основной экран
-df = get_hl_candles(coin, st.session_state['params']['tf'])
 if not df.empty:
-    df = calculate_mrc(df, st.session_state['params']['length'], st.session_state['params']['mult'])
+    df = get_mrc_values(df, st.session_state.best_params["len"], st.session_state.best_params["mult"])
     last = df.iloc[-1]
     
-    # Панель статуса
-    status = "NEUTRAL"
-    color = "#808080"
-    if last['close'] >= last['upper_2']: status, color = "STRONG SELL (OVERBOUGHT)", "#ff3a3a"
-    elif last['close'] <= last['lower_2']: status, color = "STRONG BUY (OVERSOLD)", "#00ff96"
-    
-    st.markdown(f"""
-        <div style="padding:20px; border-radius:10px; border-left: 10px solid {color}; background-color:#161b22; margin-bottom:20px">
-            <h2 style="margin:0; color:{color};">{status}</h2>
-            <p style="margin:0; opacity:0.7;">Asset: {coin} | TF: {st.session_state['params']['tf']} | Price: {last['close']}</p>
-        </div>
-    """, unsafe_allow_html=True)
+    # Профессиональный индикатор статуса
+    dist = (last['close'] - last['ml']) / last['ml'] * 100
+    if last['close'] >= last['u2']:
+        st.error(f"🚨 SELL SIGNAL: {target_coin} is Overbought | Dist from Mean: {dist:.2f}%")
+    elif last['close'] <= last['l2']:
+        st.success(f"✅ BUY SIGNAL: {target_coin} is Oversold | Dist from Mean: {dist:.2f}%")
+    else:
+        st.info(f"📊 Neutral Market | Dist from Mean: {dist:.2f}%")
 
-    # Метрики
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Current Price", f"{last['close']:.4f}")
-    m2.metric("R2 (Cloud Top)", f"{last['upper_2']:.4f}")
-    m3.metric("S2 (Cloud Bottom)", f"{last['lower_2']:.4f}")
-    m4.metric("Dist. to Mean", f"{((last['close']-last['mean_line'])/last['mean_line']*100):.2f}%")
-
-    # График
-    st.plotly_chart(plot_professional_chart(df, coin, st.session_state['params']['tf']), use_container_width=True)
+    # Построение графика
+    fig = go.Figure()
     
-    # Таблица сигналов
-    with st.expander("Detailed Parameters Table"):
-        st.dataframe(df[['timestamp', 'lower_2', 'mean_line', 'upper_2']].tail(20), use_container_width=True)
+    # Зоны (Облака)
+    fig.add_trace(go.Scatter(x=df['ts'], y=df['u2'], line=dict(color='rgba(255,0,0,0)'), showlegend=False))
+    fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], fill='tonexty', fillcolor='rgba(255,0,0,0.1)', name='Overbought Zone', line=dict(width=0)))
+    fig.add_trace(go.Scatter(x=df['ts'], y=df['l2'], fill='tonexty', fillcolor='rgba(0,255,0,0.1)', name='Oversold Zone', line=dict(width=0)))
+
+    # Свечи
+    fig.add_trace(go.Candlestick(x=df['ts'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="Price"))
+    
+    # Средняя
+    fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], line=dict(color='gold', width=2), name="Mean Line"))
+
+    fig.update_layout(height=700, template="plotly_dark", xaxis_rangeslider_visible=False,
+                      margin=dict(l=0, r=0, t=30, b=0), yaxis=dict(side="right"))
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Таблица параметров для трейдера
+    st.subheader("Cloud Parameters")
+    cols = st.columns(3)
+    cols[0].metric("Upper Cloud (R2)", f"{last['u2']:.4f}")
+    cols[1].metric("Mean Line", f"{last['ml']:.4f}")
+    cols[2].metric("Lower Cloud (S2)", f"{last['l2']:.4f}")
+
 else:
-    st.error("Connection lost. Check HyperLiquid API.")
+    st.error("Ошибка API: Не удалось получить данные. Проверьте правильность тикера или ТФ.")

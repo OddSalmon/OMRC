@@ -2,12 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import time
 
-# --- Инициализация терминала ---
-st.set_page_config(page_title="MRC v10.7: Risk Control Edition", layout="wide")
+# --- Инициализация ---
+st.set_page_config(page_title="MRC v11.1 | Engine V8.0 Full", layout="wide")
 
 st.markdown("""
     <style>
@@ -21,7 +20,7 @@ st.markdown("""
 
 HL_URL = "https://api.hyperliquid.xyz/info"
 
-# --- Математическое ядро ---
+# --- Математика V8 ---
 def ss_filter(data, l):
     res = np.zeros_like(data)
     arg = np.sqrt(2) * np.pi / l
@@ -46,160 +45,153 @@ def calculate_mrc(df, length, mult):
     df['l1'] = np.maximum(df['ml'] - (mr * np.pi * 1.0), 1e-8)
     return df
 
-# --- API Модуль: Загрузка через пагинацию ---
-def fetch_extended_1m(coin, days=30):
+# --- API: Загрузка 1-7 дней (100% плотность 1м) ---
+def fetch_extended_1m(coin, days=1):
     all_candles = []
     end_time = int(datetime.now().timestamp() * 1000)
-    total_minutes = days * 1440
-    progress_load = st.empty()
+    target_minutes = int(days * 1440)
     
-    while len(all_candles) < total_minutes:
+    while len(all_candles) < target_minutes:
         start_ts = end_time - (5000 * 60 * 1000)
         payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": start_ts, "endTime": end_time}}
         try:
-            r = requests.post(HL_URL, json=payload, timeout=15)
+            r = requests.post(HL_URL, json=payload, timeout=10)
             data = r.json()
             if not data or len(data) == 0: break
             all_candles = data + all_candles
             end_time = data[0]['t']
-            progress_load.text(f"Сборка истории 1м: {len(all_candles)}/{total_minutes} мин...")
-            if len(all_candles) > 50000: break 
+            if len(all_candles) > 11000: break 
         except: break
-    progress_load.empty()
+    
     if not all_candles: return pd.DataFrame()
-    df = pd.DataFrame(all_candles)
-    df = df.rename(columns={'t':'ts','o':'open','h':'high','l':'low','c':'close','v':'vol'})
+    df = pd.DataFrame(all_candles).rename(columns={'t':'ts','o':'open','h':'high','l':'low','c':'close','v':'vol'})
     for c in ['open','high','low','close']: df[c] = df[c].astype(float)
     df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-    return df.drop_duplicates(subset='ts').sort_values('ts')
+    return df.drop_duplicates(subset='ts').sort_values('ts').tail(target_minutes)
 
-# --- Оптимизатор V8 + Time to Recovery ---
+# --- Оптимизатор V8.0 (ПОЛНЫЙ ПЕРЕБОР 1-60) ---
 def run_full_v8_optimization(coin, days):
-    df_full = fetch_extended_1m(coin, days)
-    if df_full.empty: return None
+    df_1m = fetch_extended_1m(coin, days)
+    if df_1m.empty: return None
 
-    best_p = {"score": -1}
-    tfs = range(1, 61)
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    best = {"score": -1}
+    tfs = range(1, 61) # Шаг в 1 минуту, как в оригинальной v8.0
     
-    for i, tf in enumerate(tfs):
-        status_text.text(f"Анализ риска {days} дн: {tf} мин...")
-        df_tf = df_full.set_index('ts').resample(f'{tf}T').agg({
-            'open':'first','high':'max','low':'min','close':'last','vol':'sum'
-        }).dropna().reset_index()
-        
-        if len(df_tf) < 260: continue
+    progress = st.progress(0)
+    status = st.empty()
+    
+    total_iters = len(tfs) * 3 * 3 # 3 Lengths * 3 Mults
+    count = 0
+
+    for tf in tfs:
+        status.text(f"Сканирование ТФ: {tf} мин...")
+        df_tf = df_1m.set_index('ts').resample(f'{tf}T').agg({'open':'first','high':'max','low':'min','close':'last'}).dropna().reset_index()
+        if len(df_tf) < 200: continue
         
         for l in [150, 200, 250]:
             for m in [2.1, 2.4, 2.8]:
+                count += 1
                 df_mrc = calculate_mrc(df_tf.copy(), l, m)
-                test_slice = df_mrc.iloc[l:]
-                ob = test_slice[test_slice['high'] >= test_slice['u2']].index
-                os = test_slice[test_slice['low'] <= test_slice['l2']].index
-                sigs = list(ob) + list(os)
+                slice_df = df_mrc.tail(300)
                 
-                if len(sigs) < 5: continue
+                ob = slice_df[slice_df['high'] >= slice_df['u2']].index
+                os = slice_df[slice_df['low'] <= slice_df['l2']].index
+                sigs = list(ob) + list(os)
+                if len(sigs) < 4: continue
                 
                 reversions = 0
                 recovery_times = []
-                
                 for idx in sigs:
-                    # Ищем возврат к средней без ограничения в 10 свечей для TTR
-                    # Но для RevRate используем стандарт V8 (10 свечей)
-                    future = df_mrc.loc[idx : idx + 50] # Смотрим окно в 50 свечей
-                    
-                    # 1. Считаем классический возврат V8
-                    window_10 = future.head(10)
-                    if not window_10.empty and ((window_10['low'] <= window_10['ml']) & (window_10['high'] >= window_10['ml'])).any():
-                        reversions += 1
-                    
-                    # 2. Считаем время до восстановления (TTR)
-                    found_recovery = False
-                    for offset, f_row in enumerate(future.itertuples()):
-                        if f_row.low <= f_row.ml <= f_row.high:
+                    # Критерий возврата V8.0 (окно 10-20 свечей)
+                    future = df_mrc.loc[idx : idx + 20]
+                    found = False
+                    for offset, row in enumerate(future.itertuples()):
+                        if row.low <= row.ml <= row.high:
+                            reversions += 1
                             recovery_times.append(offset)
-                            found_recovery = True
+                            found = True
                             break
-                    if not found_recovery: recovery_times.append(50) # Штраф за отсутствие возврата
+                    if not found: recovery_times.append(20)
                 
                 rev_rate = reversions / len(sigs)
-                max_ttr = max(recovery_times) if recovery_times else 0
-                avg_ttr = np.mean(recovery_times) if recovery_times else 50
+                avg_mdd = np.mean(recovery_times) if recovery_times else 20
                 
-                # Score: поощряем возврат, наказываем за долгое ожидание
-                score = (rev_rate * np.log(len(sigs))) / (max_ttr * (df_mrc['u2'].mean() - df_mrc['l2'].mean()) + 0.1)
+                # Классический Score из v8.0
+                score = (rev_rate * np.sqrt(len(sigs))) / (avg_mdd + 0.1)
                 
-                if score > best_p['score']:
-                    best_p = {
-                        "tf": tf, "l": l, "m": m, "score": score, 
-                        "rev": rev_rate, "signals": len(sigs), "max_ttr": max_ttr
-                    }
-        progress_bar.progress((i+1)/60)
-
-    status_text.empty()
-    progress_bar.empty()
-    return best_p
+                if score > best['score']:
+                    best = {"tf": tf, "l": l, "m": m, "score": score, "rev": rev_rate, "ttr": avg_mdd, "sigs": len(sigs)}
+        progress.progress(tf / 60)
+    
+    status.empty()
+    progress.empty()
+    return best
 
 # --- UI Sidebar ---
+if 'tab' not in st.session_state: st.session_state.tab = "Терминал"
+
 with st.sidebar:
-    st.header("🧬 MRC Terminal v10.7")
-    if 'tokens' not in st.session_state:
-        try:
-            r = requests.post(HL_URL, json={"type": "metaAndAssetCtxs"}).json()
-            st.session_state.tokens = sorted([a['name'] for a in r[0]['universe']])
-        except: st.session_state.tokens = ["BTC", "ETH", "SOL"]
+    st.header("🧬 MRC Terminal v11.1")
+    tokens = sorted([a['name'] for a in requests.post(HL_URL, json={"type": "metaAndAssetCtxs"}).json()[0]['universe']])
+    target_coin = st.selectbox("Актив", tokens, index=tokens.index("BTC") if "BTC" in tokens else 0)
     
-    target_coin = st.selectbox("Актив", st.session_state.tokens, index=st.session_state.tokens.index("BTC") if "BTC" in st.session_state.tokens else 0)
-    opt_days = st.selectbox("Глубина анализа", [3, 7, 14, 30], index=1)
+    st.divider()
+    opt_days = st.slider("Глубина истории (дней)", 1, 7, 3)
     
     if 'cfg' not in st.session_state:
-        st.session_state.cfg = {"tf": 60, "l": 200, "m": 2.4, "rev": 0, "signals": 0, "max_ttr": 0}
+        st.session_state.cfg = {"tf": 60, "l": 200, "m": 2.4, "rev": 0, "ttr": 0, "sigs": 0}
 
-    if st.button("🔥 ГЛУБОКИЙ ПОИСК + РИСК-АНАЛИЗ"):
+    if st.button("🔥 ОПТИМИЗИРОВАТЬ (ENGINE V8.0)"):
         res = run_full_v8_optimization(target_coin, opt_days)
-        if res: st.session_state.cfg = res; st.success(f"Идеал: {res['tf']}м")
+        if res: 
+            st.session_state.cfg = res
+            st.success(f"Идеал найден: {res['tf']}м")
 
-# --- Вкладки ---
-tab1, tab2 = st.tabs(["📊 Терминал (Live)", "🔍 Скринер ТОП-50"])
+    st.divider()
+    if st.button("🔍 ПЕРЕЙТИ К СКРИНЕРУ"):
+        st.session_state.tab = "Скринер"
+        st.rerun()
 
-with tab1:
-    df_live = fetch_extended_1m(target_coin, days=2)
+# --- Tabs ---
+tab_terminal, tab_screener = st.tabs(["📊 Терминал", "🎯 Скринер"])
+
+with tab_terminal:
+    df_live = fetch_extended_1m(target_coin, days=1)
     if not df_live.empty:
-        df_tf = df_live.set_index('ts').resample(f"{st.session_state.cfg['tf']}T").agg({
-            'open':'first','high':'max','low':'min','close':'last','vol':'sum'
-        }).dropna().reset_index()
-        
+        df_tf = df_live.set_index('ts').resample(f"{st.session_state.cfg['tf']}T").agg({'open':'first','high':'max','low':'min','close':'last'}).dropna().reset_index()
         df = calculate_mrc(df_tf, st.session_state.cfg['l'], st.session_state.cfg['m'])
+        last = df.iloc[-1]
         
-        if len(df) > st.session_state.cfg['l']:
-            df = df.iloc[st.session_state.cfg['l']:]
-            last = df.iloc[-1]
-            st.markdown(f"<div class='status-box'><h2 style='margin:0;'>{target_coin} | Таймфрейм: {st.session_state.cfg['tf']}м</h2></div>", unsafe_allow_html=True)
-            
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Цена", f"{last['close']:.4f}")
-            c2.metric("Вер. возврата", f"{st.session_state.cfg['rev']*100:.1f}%")
-            
-            # Расчет времени восстановления в минутах
-            ttr_min = st.session_state.cfg['max_ttr'] * st.session_state.cfg['tf']
-            c3.metric("Max Recovery Time", f"{ttr_min} мин", help="Максимальное время, которое цена проводила вне средней линии после сигнала")
-            c4.metric("Сигналов (база)", st.session_state.cfg['signals'])
+        st.markdown(f"<div class='status-box'><h2 style='margin:0;'>{target_coin} | ТФ: {st.session_state.cfg['tf']}м | Оптимизация: {opt_days}д</h2></div>", unsafe_allow_html=True)
+        
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Текущая цена", f"{last['close']:.4f}")
+        c2.metric("Вероятность возврата", f"{st.session_state.cfg['rev']*100:.1f}%")
+        c3.metric("Среднее время возврата", f"{int(st.session_state.cfg['ttr'] * st.session_state.cfg['tf'])} мин")
+        c4.metric("Сигналов найдено", st.session_state.cfg['sigs'])
 
-            # График (Professional Framing)
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df['ts'], y=df['u1'], line=dict(width=0), showlegend=False))
-            fig.add_trace(go.Scatter(x=df['ts'], y=df['u2'], fill='tonexty', fillcolor='rgba(255,50,50,0.2)', name='Sell Cloud'))
-            fig.add_trace(go.Scatter(x=df['ts'], y=df['l1'], line=dict(width=0), showlegend=False))
-            fig.add_trace(go.Scatter(x=df['ts'], y=df['l2'], fill='tonexty', fillcolor='rgba(50,255,150,0.2)', name='Buy Cloud'))
-            fig.add_trace(go.Candlestick(x=df['ts'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'))
-            fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], line=dict(color='gold', width=1.5), name='Mean'))
+        st.subheader("📋 Таблица ценовых уровней")
+        display_df = df[['ts', 'l2', 'l1', 'ml', 'u1', 'u2', 'close']].tail(20).copy()
+        display_df.columns = ['Время', 'S2 (Нижний предел)', 'S1 (Вход Buy)', 'Средняя (Take Profit)', 'R1 (Вход Sell)', 'R2 (Верхний предел)', 'Цена']
+        st.dataframe(display_df.style.format(precision=4), use_container_width=True)
 
-            view = df.tail(100)
-            fig.update_layout(height=700, template="plotly_dark", xaxis_rangeslider_visible=False,
-                yaxis=dict(range=[view['low'].min()*0.99, view['high'].max()*1.01], side="right"),
-                margin=dict(l=0, r=0, t=10, b=0))
-            st.plotly_chart(fig, use_container_width=True)
-            
-            st.subheader("📋 Таблица параметров (Ордера)")
-            st.dataframe(df[['ts', 'l2', 'l1', 'ml', 'u1', 'u2', 'close']].tail(15), use_container_width=True)
+with tab_screener:
+    st.header("🎯 Скринер сигналов ТОП-50")
+    if st.button("🚀 ЗАПУСТИТЬ СКАНЕР РЫНКА"):
+        results = []
+        bar = st.progress(0)
+        top_50 = tokens[:50]
+        for i, token in enumerate(top_50):
+            df_s = fetch_extended_1m(token, days=1)
+            if not df_s.empty:
+                df_s_tf = df_s.set_index('ts').resample(f"{st.session_state.cfg['tf']}T").agg({'close':'last','high':'max','low':'min','open':'first'}).dropna().reset_index()
+                if len(df_s_tf) > st.session_state.cfg['l']:
+                    df_s_tf = calculate_mrc(df_s_tf, st.session_state.cfg['l'], st.session_state.cfg['m'])
+                    l_s = df_s_tf.iloc[-1]
+                    status = "Нейтрально"
+                    if l_s['close'] >= l_s['u2']: status = "🔴 ПРОДАЖА"
+                    elif l_s['close'] <= l_s['l2']: status = "🟢 ПОКУПКА"
+                    if status != "Нейтрально":
+                        results.append({'Монета': token, 'Статус': status, 'Цена': round(l_s['close'], 4), 'Откл %': round((l_s['close']-l_s['ml'])/l_s['ml']*100, 2)})
+            bar.progress((i+1)/50)
+        st.dataframe(pd.DataFrame(results).sort_values('Откл %', ascending=False), use_container_width=True)

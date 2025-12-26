@@ -4,29 +4,31 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import time
 
-# --- Настройки ---
-st.set_page_config(page_title="MRC Martingale Backtester", layout="wide")
+# --- Инициализация и Стили ---
+st.set_page_config(page_title="MRC Hybrid Terminal v10.0", layout="wide")
 
 st.markdown("""
     <style>
     .stApp { background-color: #0d1117; color: #c9d1d9; }
     .stMetric { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 15px; }
+    [data-testid="stMetricValue"] { color: #58a6ff !important; font-family: 'Courier New', monospace; }
     div.stButton > button { width: 100%; border-radius: 5px; height: 3.5em; background-color: #238636; color: white; font-weight: bold; }
+    .status-box { padding: 15px; border-radius: 10px; border-left: 5px solid #58a6ff; background-color: #161b22; margin-bottom: 20px; }
     </style>
 """, unsafe_allow_html=True)
 
 HL_URL = "https://api.hyperliquid.xyz/info"
 
-# --- Математика MRC ---
+# --- Математическое Ядро ---
 def ss_filter(data, l):
     res = np.zeros_like(data)
     arg = np.sqrt(2) * np.pi / l
     a1, b1 = np.exp(-arg), 2 * np.exp(-arg) * np.cos(arg)
-    c2, c3 = b1, -a1**2
-    c1 = 1 - c2 - c3
+    c1 = 1 - b1 + a1**2
     for i in range(len(data)):
-        res[i] = c1*data[i] + c2*res[i-1] + c3*res[i-2] if i >= 2 else data[i]
+        res[i] = c1*data[i] + b1*res[i-1] - (a1**2)*res[i-2] if i >= 2 else data[i]
     return res
 
 def calculate_mrc(df, length, mult):
@@ -41,148 +43,123 @@ def calculate_mrc(df, length, mult):
     df['l2'] = np.maximum(df['ml'] - (mr * np.pi * mult), 1e-8)
     return df
 
-# --- Загрузка данных (Месяц истории) ---
-def fetch_backtest_data(coin):
-    # Пытаемся забрать 5000 свечей (максимум API за один раз)
-    # Для ТФ 15м это около 52 дней истории
-    start_ts = int((datetime.now() - timedelta(days=31)).timestamp() * 1000)
-    payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": "15m", "startTime": start_ts}}
+# --- API и Данные ---
+@st.cache_data(ttl=600)
+def get_tokens():
+    try:
+        r = requests.post(HL_URL, json={"type": "metaAndAssetCtxs"}).json()
+        return sorted([a['name'] for a in r[0]['universe']])
+    except: return ["BTC", "ETH", "SOL"]
+
+def fetch_hl_data(coin, interval, days=3):
+    start_ts = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+    payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "startTime": start_ts}}
     try:
         r = requests.post(HL_URL, json=payload, timeout=15)
         df = pd.DataFrame(r.json())
         if df.empty: return df
         df = df.rename(columns={'t':'ts','o':'open','h':'high','l':'low','c':'close','v':'vol'})
-        for c in ['open','high','low','close']: df[c] = df[c].astype(float)
+        for c in ['open','high','low','close','vol']: df[c] = df[c].astype(float)
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         return df
     except: return pd.DataFrame()
 
-# --- Логика Бектеста с Мартингейлом ---
-def run_martingale_backtest(df):
-    balance = 1000.0  # Начальный баланс $
-    position = 0.0    # Размер позиции в монетах
-    entry_price = 0.0
-    trades = []
-    pnl_history = [balance]
-    
-    in_position = False
-    side = None # "LONG" или "SHORT"
-    current_size = 100.0 # Базовая ставка в $
-    
+# --- Логика Оптимизации (1-60 мин) ---
+def run_full_optimization(coin):
+    df_1m = fetch_hl_data(coin, "1m", days=4)
+    if df_1m.empty: return None
+    best_p = {"score": -1}
+    tfs = range(1, 61)
+    bar = st.progress(0)
+    for i, tf in enumerate(tfs):
+        df_tf = df_1m.set_index('ts').resample(f'{tf}T').agg({
+            'open':'first','high':'max','low':'min','close':'last','vol':'sum'
+        }).dropna().reset_index()
+        if len(df_tf) < 250: continue
+        for l in [150, 250]:
+            for m in [2.4, 2.8]:
+                df_mrc = calculate_mrc(df_tf.copy(), l, m)
+                last_slice = df_mrc.tail(200)
+                ob = last_slice[last_slice['high'] >= last_slice['u2']].index
+                os = last_slice[last_slice['low'] <= last_slice['l2']].index
+                total = len(ob) + len(os)
+                if total < 3: continue
+                # Упрощенный скоринг для скорости
+                score = total / (df_mrc['u2'].mean() - df_mrc['l2'].mean())
+                if score > best_p['score']:
+                    best_p = {"tf": tf, "l": l, "m": m, "score": score}
+        bar.progress((i+1)/len(tfs))
+    return best_p
+
+# --- Логика Мартингейл Бектеста ---
+def backtest_martingale(df):
+    balance, pos, entry, trades = 1000.0, 0.0, 0.0, []
+    pnl_path = [balance]
     for i in range(1, len(df)):
         row = df.iloc[i]
-        
-        if not in_position:
-            # Вход в LONG
+        if pos == 0:
             if row['low'] <= row['l2']:
-                side = "LONG"
-                in_position = True
-                entry_price = row['l2']
-                position = current_size / entry_price
-                trades.append({'ts': row['ts'], 'type': 'BUY', 'price': entry_price})
-            
-            # Вход в SHORT
+                entry, pos = row['l2'], 100.0 / row['l2']
+                trades.append({'ts':row['ts'], 'type':'BUY', 'price':entry})
             elif row['high'] >= row['u2']:
-                side = "SHORT"
-                in_position = True
-                entry_price = row['u2']
-                position = current_size / entry_price
-                trades.append({'ts': row['ts'], 'type': 'SELL', 'price': entry_price})
-        
+                entry, pos = row['u2'], -100.0 / row['u2']
+                trades.append({'ts':row['ts'], 'type':'SELL', 'price':entry})
         else:
-            # Логика выхода (Mean Reversion)
-            if side == "LONG":
-                # Усреднение (Мартингейл) - если цена упала на 1.5% ниже входа
-                if row['low'] <= entry_price * 0.985:
-                    add_size = current_size * 2 # Удвоение
-                    position += add_size / row['low']
-                    entry_price = (entry_price * (position - add_size/row['low']) + row['low'] * (add_size/row['low'])) / position
-                    trades.append({'ts': row['ts'], 'type': 'MAR_BUY', 'price': row['low']})
-                
-                # Тейк-профит на средней линии
-                if row['high'] >= row['ml']:
-                    profit = (row['ml'] - entry_price) * position
-                    balance += profit
-                    trades.append({'ts': row['ts'], 'type': 'EXIT', 'price': row['ml']})
-                    in_position = False
-                    position = 0
-                    
-            elif side == "SHORT":
-                # Усреднение (Мартингейл) - если цена выросла на 1.5% выше входа
-                if row['high'] >= entry_price * 1.015:
-                    add_size = current_size * 2
-                    position += add_size / row['high']
-                    entry_price = (entry_price * (position - add_size/row['high']) + row['high'] * (add_size/row['high'])) / position
-                    trades.append({'ts': row['ts'], 'type': 'MAR_SELL', 'price': row['high']})
-                
-                # Тейк-профит на средней линии
-                if row['low'] <= row['ml']:
-                    profit = (entry_price - row['ml']) * position
-                    balance += profit
-                    trades.append({'ts': row['ts'], 'type': 'EXIT', 'price': row['ml']})
-                    in_position = False
-                    position = 0
-        
-        pnl_history.append(balance)
-        
-    df['balance'] = pnl_history
+            # Тейк на средней линии
+            if (pos > 0 and row['high'] >= row['ml']) or (pos < 0 and row['low'] <= row['ml']):
+                balance += pos * (row['ml'] - entry) if pos > 0 else abs(pos) * (entry - row['ml'])
+                trades.append({'ts':row['ts'], 'type':'EXIT', 'price':row['ml']})
+                pos = 0
+        pnl_path.append(balance)
+    df['balance'] = pnl_path
     return df, trades
 
-# --- UI ---
-st.sidebar.header("📊 MRC Backtest Station")
-all_tokens = get_tokens() if 'get_tokens' in globals() else ["BTC", "ETH", "SOL"]
-coin = st.sidebar.selectbox("Актив", all_tokens, index=all_tokens.index("BTC") if "BTC" in all_tokens else 0)
+# --- UI Sidebar ---
+with st.sidebar:
+    st.header("🧬 MRC Терминал v10")
+    tokens = get_tokens()
+    coin = st.selectbox("Актив", tokens, index=tokens.index("BTC") if "BTC" in tokens else 0)
+    if 'cfg' not in st.session_state: st.session_state.cfg = {"tf": 60, "l": 200, "m": 2.4}
+    
+    if st.button("🔥 ГЛУБОКАЯ ОПТИМИЗАЦИЯ (1-60м)"):
+        res = run_full_optimization(coin)
+        if res: st.session_state.cfg = res; st.rerun()
 
-if st.sidebar.button("🚀 ЗАПУСТИТЬ БЕКТЕСТ (МЕСЯЦ)"):
-    with st.spinner("Загрузка данных и расчет стратегии..."):
-        df_raw = fetch_backtest_data(coin)
-        if not df_raw.empty:
-            # Оптимальные параметры (можно добавить ваш цикл оптимизации сюда)
-            df = calculate_mrc(df_raw, 200, 2.4)
-            df_res, trades = run_martingale_backtest(df)
+# --- Основные Вкладки ---
+tab1, tab2 = st.tabs(["📊 Терминал (Live)", "🧪 Бектест (Martingale)"])
+
+with tab1:
+    df_raw = fetch_hl_data(coin, "1m", days=4)
+    if not df_raw.empty:
+        df_tf = df_raw.set_index('ts').resample(f"{st.session_state.cfg['tf']}T").agg({
+            'open':'first','high':'max','low':'min','close':'last','vol':'sum'
+        }).dropna().reset_index()
+        df = calculate_mrc(df_tf, st.session_state.cfg['l'], st.session_state.cfg['m']).tail(200)
+        last = df.iloc[-1]
+        
+        st.metric("BTC Цена", f"{last['close']:.2f}", f"ТФ: {st.session_state.cfg['tf']}м")
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df['ts'], y=df['u2'], line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=df['ts'], y=df['ml'], fill='tonexty', fillcolor='rgba(255,50,50,0.1)', name='Sell Zone'))
+        fig.add_trace(go.Scatter(x=df['ts'], y=df['l2'], fill='tonexty', fillcolor='rgba(50,255,150,0.1)', name='Buy Zone'))
+        fig.add_trace(go.Candlestick(x=df['ts'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'))
+        fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.subheader("📋 Границы облаков")
+        st.dataframe(df[['ts', 'l2', 'ml', 'u2', 'close']].tail(10), use_container_width=True)
+
+with tab2:
+    st.header("Симуляция стратегии за месяц")
+    if st.button("Запустить бектест"):
+        data_bt = fetch_hl_data(coin, "15m", days=30)
+        if not data_bt.empty:
+            df_bt = calculate_mrc(data_bt, st.session_state.cfg['l'], st.session_state.cfg['m'])
+            res_df, trades = backtest_martingale(df_bt)
             
-            # Статистика
-            total_profit = df_res['balance'].iloc[-1] - 1000
-            st.subheader(f"Результаты бектеста за месяц: {coin}")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Чистая прибыль", f"${total_profit:.2f}")
-            c2.metric("Всего сделок", len([t for t in trades if t['type'] in ['BUY', 'SELL']]))
-            c3.metric("Усреднений (Мартин)", len([t for t in trades if 'MAR' in t['type']]))
-
-            # --- ГРАФИК БЕКТЕСТА ---
-            fig = go.Figure()
-            # Индикатор
-            fig.add_trace(go.Scatter(x=df_res['ts'], y=df_res['u2'], line=dict(color='rgba(255,0,0,0.2)'), name='Верхняя граница'))
-            fig.add_trace(go.Scatter(x=df_res['ts'], y=df_res['ml'], line=dict(color='gold', width=1), name='Средняя'))
-            fig.add_trace(go.Scatter(x=df_res['ts'], y=df_res['l2'], line=dict(color='rgba(0,255,0,0.2)'), name='Нижняя граница'))
-            
-            # Цена
-            fig.add_trace(go.Candlestick(x=df_res['ts'], open=df_res['open'], high=df_res['high'], low=df_res['low'], close=df_res['close'], name='Цена'))
-
-            # Маркеры сделок
-            for t in trades:
-                color = 'green' if 'BUY' in t['type'] else 'red' if 'SELL' in t['type'] else 'white'
-                symbol = 'triangle-up' if 'BUY' in t['type'] else 'triangle-down' if 'SELL' in t['type'] else 'x'
-                fig.add_trace(go.Scatter(x=[t['ts']], y=[t['price']], mode='markers', 
-                                         marker=dict(color=color, size=10, symbol=symbol), showlegend=False))
-
-            fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False, title="График входов и выходов (Мартингейл)")
-            st.plotly_chart(fig, use_container_width=True)
-
-            # --- ГРАФИК ДОХОДНОСТИ ---
-            fig_pnl = go.Figure()
-            fig_pnl.add_trace(go.Scatter(x=df_res['ts'], y=df_res['balance'], line=dict(color='#00ff96', width=2), fill='tozeroy', name='Баланс ($)'))
-            fig_pnl.update_layout(height=300, template="plotly_dark", title="Кривая капитала (Equity Curve)")
+            st.metric("Итоговый баланс", f"${res_df['balance'].iloc[-1]:.2f}")
+            fig_pnl = go.Figure(go.Scatter(x=res_df['ts'], y=res_df['balance'], fill='tozeroy', name='Equity'))
+            fig_pnl.update_layout(height=400, template="plotly_dark", title="Кривая капитала")
             st.plotly_chart(fig_pnl, use_container_width=True)
-            
-            # Таблица сделок
-            st.subheader("Журнал сделок")
-            st.dataframe(pd.DataFrame(trades).tail(20), use_container_width=True)
-        else:
-            st.error("Ошибка загрузки данных.")
-else:
-    st.info("Выберите монету и нажмите кнопку для запуска бектеста.")
-
-def get_tokens(): # Упрощенная для примера
-    try: return sorted([a['name'] for a in requests.post(HL_URL, json={"type": "meta"}).json()['universe']])
-    except: return ["BTC", "ETH"]
+            st.dataframe(pd.DataFrame(trades).tail(20))

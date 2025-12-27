@@ -2,31 +2,56 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from scipy.stats import norm
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="MRC v57 | Time-Normalized", layout="wide")
+# --- INDUSTRIAL CONFIG ---
+st.set_page_config(page_title="MRC v59 | Classic V8", layout="wide")
 st.markdown("""
     <style>
     .stApp { background-color: #0b0e11; color: #c9d1d9; font-family: 'Roboto', sans-serif; }
+    
+    /* Metrics */
     .metric-container {
         background-color: #151a21; border: 1px solid #2a3038; border-radius: 6px; padding: 15px;
-        margin-bottom: 10px;
+        margin-bottom: 10px; transition: border-color 0.3s;
     }
+    .metric-container:hover { border-color: #58a6ff; }
+    
+    /* Typography */
     .value-lg { font-size: 1.5rem; font-weight: 700; color: #f0f6fc; font-family: 'Roboto Mono', monospace; }
     .label-sm { font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+    
+    /* Accents */
     .acc-buy { color: #2ea043 !important; }
     .acc-sell { color: #da3633 !important; }
-    .acc-wait { color: #8b949e !important; }
-    [data-testid="stDataFrame"] { border: 1px solid #30363d; }
+    .acc-info { color: #58a6ff !important; }
+    
+    /* Insight Panel */
+    .insight-panel {
+        background: #161b22; border-left: 4px solid #a371f7; padding: 15px; border-radius: 4px; margin-bottom: 20px;
+    }
+    
+    /* Table */
+    [data-testid="stDataFrame"] { border: 1px solid #30363d; border-radius: 6px; }
     </style>
 """, unsafe_allow_html=True)
 
 API_URL = "https://api.hyperliquid.xyz/info"
 
-# --- 1. MATH ENGINE ---
+# --- 1. OPTION MATH ENGINE (Black-Scholes) ---
+class OptionMath:
+    def __init__(self, S, K, T, r, sigma):
+        self.S = S; self.K = K; self.T = T; self.r = r; self.sigma = sigma
+        self.d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+        self.d2 = self.d1 - sigma*np.sqrt(T)
+    def delta(self, type='call'):
+        return norm.cdf(self.d1) if type=='call' else norm.cdf(self.d1)-1
+    def theta(self):
+        return (- (self.S * norm.pdf(self.d1) * self.sigma) / (2 * np.sqrt(self.T)) - self.r * self.K * np.exp(-self.r*self.T) * norm.cdf(self.d2)) / 365
+
+# --- 2. MRC MATH ENGINE ---
 def super_smoother(data, length):
     if len(data) < 4: return data
     res = np.zeros_like(data)
@@ -58,7 +83,7 @@ def calculate_mrc(df, length=200, mult=2.4):
     df['atr'] = tr.rolling(14).mean()
     return df
 
-# --- 2. DATA LAYER ---
+# --- 3. DATA LAYER ---
 @st.cache_data(ttl=300)
 def get_metadata():
     try:
@@ -69,7 +94,7 @@ def get_metadata():
         return pd.DataFrame(data).sort_values('volume', ascending=False)
     except: return pd.DataFrame()
 
-def fetch_candles(coin, days=5):
+def fetch_candles(coin, days=4): # Reduced to 4 days for speed/relevance
     ts_start = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
     try:
         r = requests.post(API_URL, json={"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": ts_start}}, timeout=10).json()
@@ -80,20 +105,21 @@ def fetch_candles(coin, days=5):
         return df.sort_values('ts')
     except: return pd.DataFrame()
 
-# --- 3. V8 TIME-NORMALIZED OPTIMIZER ---
+# --- 4. CLASSIC V8 ENGINE (RESTORED) ---
 @st.cache_data(ttl=600, show_spinner=False)
 def v8_optimizer(coin, funding):
     raw = fetch_candles(coin)
     if raw.empty: return None
     raw = raw.set_index('ts')
     
+    # Global Volatility (Annualized)
     current_hv = raw['close'].pct_change().rolling(1440).std() * np.sqrt(525600) * 100
     hv_val = current_hv.iloc[-1] if not pd.isna(current_hv.iloc[-1]) else 50.0
 
     best = {"score": -1, "tf": 0, "signal": "WAIT"}
     stack = []
     
-    # Brute Force 1-60m
+    # BRUTE FORCE 1-60 MIN
     for tf in range(1, 61):
         df_tf = raw.resample(f'{tf}min').agg({'open':'first','high':'max','low':'min','close':'last','vol':'sum'}).dropna()
         if len(df_tf) < 100: continue
@@ -102,28 +128,28 @@ def v8_optimizer(coin, funding):
         if df_m is None: continue
         
         last = df_m.iloc[-1]
-        stack.append(last['u2']); stack.append(last['l2'])
+        stack.append({'u2': last['u2'], 'l2': last['l2']})
         
-        # Valid Signals
+        # Valid Signals (Relaxed filter: min 3 signals)
         sigs = df_m[(df_m['high'] >= df_m['u2']) | (df_m['low'] <= df_m['l2'])].index
-        if len(sigs) < 5: continue 
+        if len(sigs) < 3: continue 
         
-        # --- TIME-NORMALIZED BACKTEST ---
-        # Lookahead is strictly 12 Hours (720 mins) regardless of TF
-        lookahead_bars = int(720 / tf) 
-        
+        # --- CLASSIC BACKTEST ---
+        # Fixed 20-bar lookahead. Reversion MUST happen fast.
+        lookahead_bars = 20
         hits = 0
         valid = 0
+        
         for idx in sigs[:-1]:
             target = df_m.loc[idx]['ml']
             entry = df_m.loc[idx]['close']
-            future = df_m.loc[idx:].head(lookahead_bars) # Dynamic window
+            future = df_m.loc[idx:].head(lookahead_bars)
             if len(future) < 2: continue
             
             reverted = False
-            if entry > target: # Short
+            if entry > target: 
                 if (future['low'] <= target).any(): reverted = True
-            else: # Long
+            else: 
                 if (future['high'] >= target).any(): reverted = True
             
             if reverted: hits += 1
@@ -132,16 +158,16 @@ def v8_optimizer(coin, funding):
         if valid == 0: continue
         prob = hits / valid
         
-        # Stability Score
-        # Now that prob is fair, we can use it directly
-        score = prob * np.log1p(valid)
+        # --- THE ORIGINAL SCORE FORMULA ---
+        # Balance Quality (Prob) and Quantity (Sqrt of signals)
+        # This naturally favors lower TFs (more signals) without over-weighting noise.
+        score = prob * np.sqrt(valid)
         
         if score > best['score']:
             sig = "WAIT"
             if last['close'] >= last['u2']: sig = "SELL"
             elif last['close'] <= last['l2']: sig = "BUY"
             
-            # Dist %
             dist = 0.0
             if last['close'] > last['ml']: dist = (last['u2'] - last['close']) / last['close'] * 100
             else: dist = (last['close'] - last['l2']) / last['close'] * 100
@@ -154,35 +180,38 @@ def v8_optimizer(coin, funding):
                 "hv": hv_val, "dist": dist, "funding": funding
             })
             
-    # Cluster
-    stack.sort()
+    # Calculate Clusters
     if stack:
-        best['clus_l2'] = np.mean(stack[:10])
-        best['clus_u2'] = np.mean(stack[-10:])
+        u_p = sorted([x['u2'] for x in stack])
+        l_p = sorted([x['l2'] for x in stack])
+        best['clus_l2'] = np.mean(l_p[:10])
+        best['clus_u2'] = np.mean(u_p[-10:])
         
-    return best
+    return {"best": best, "stack": stack} if best['tf'] > 0 else None
 
-# --- 4. UI ---
+# --- 5. UI ---
 if "state" not in st.session_state: st.session_state.state = {}
 
-t_scan, t_anal = st.tabs(["[ 01 // SCREENER ]", "[ 02 // ANALYSIS ]"])
+t_scan, t_anal, t_clus, t_opt = st.tabs(["[ 01 // SCREENER ]", "[ 02 // ANALYSIS ]", "[ 03 // CLUSTERS ]", "[ 04 // OPTION LAB ]"])
 
+# [ 01 ] SCREENER
 with t_scan:
     c1, c2 = st.columns([1, 4])
     with c1:
-        if st.button("SCAN TOP 15", use_container_width=True): # Reduced to 15
+        if st.button("SCAN TOP 15", use_container_width=True):
             meta = get_metadata().head(15)
             progress = st.progress(0)
             with ThreadPoolExecutor(max_workers=4) as exe:
                 futs = {exe.submit(v8_optimizer, r['name'], r['funding']): r['name'] for _, r in meta.iterrows()}
                 for i, f in enumerate(as_completed(futs)):
                     res = f.result()
-                    if res and res['tf'] > 0: st.session_state.state[res['coin']] = res
+                    if res: st.session_state.state[res['best']['coin']] = res
                     progress.progress((i+1)/len(meta))
             progress.empty()
             
     if st.session_state.state:
-        df = pd.DataFrame(st.session_state.state.values())
+        flat_data = [v['best'] for v in st.session_state.state.values()]
+        df = pd.DataFrame(flat_data)
         
         def get_stat(r):
             if r['rvol'] > 3.0: return "⚠️ VOL"
@@ -205,16 +234,26 @@ with t_scan:
             use_container_width=True, height=600
         )
 
+# [ 02 ] ANALYSIS
 with t_anal:
     assets = list(st.session_state.state.keys()) if st.session_state.state else get_metadata()['name'].head(15).tolist()
     target = st.selectbox("ASSET", assets)
     
     if st.button("DIAGNOSE") or target in st.session_state.state:
         if target not in st.session_state.state:
-            funding = get_metadata()[get_metadata()['name']==target]['funding'].values[0]
-            st.session_state.state[target] = v8_optimizer(target, funding)
+            with st.spinner("Processing..."):
+                f = get_metadata(); fund = f[f['name']==target]['funding'].values[0]
+                st.session_state.state[target] = v8_optimizer(target, fund)
         
-        d = st.session_state.state[target]
+        d = st.session_state.state[target]['best']
+        
+        insight = ""
+        if d['rvol'] > 3.0: insight = f"⚠️ **CAUTION:** RVOL is {d['rvol']:.2f}x (Breakout Mode). Mean reversion risks are high."
+        elif d['prob'] < 0.6: insight = f"⚠️ **WEAK EDGE:** Win Rate on {d['tf']}m cycle is only {d['prob']*100:.0f}%. Wait for clusters."
+        elif d['signal'] != "WAIT": insight = f"✅ **SIGNAL:** V8 confirms {d['signal']} trigger on {d['tf']}m cycle with {d['prob']*100:.0f}% accuracy."
+        else: insight = f"ℹ️ **TRACKING:** Price is {abs(d['dist']):.2f}% from trigger. Volatility: {d['hv']:.1f}%."
+
+        st.markdown(f"<div class='insight-panel'><div style='color:#a371f7;font-weight:bold'>V8 INTELLIGENCE</div>{insight}</div>", unsafe_allow_html=True)
         
         c1, c2, c3, c4 = st.columns(4)
         c1.markdown(f"<div class='metric-container'><div class='label-sm'>CYCLE</div><div class='value-lg'>{d['tf']}m</div></div>", unsafe_allow_html=True)
@@ -223,6 +262,59 @@ with t_anal:
         c4.markdown(f"<div class='metric-container'><div class='label-sm'>Z-SCORE</div><div class='value-lg'>{d['zscore']:.2f}σ</div></div>", unsafe_allow_html=True)
         
         k1, k2, k3 = st.columns(3)
-        with k1: st.markdown(f"<div class='metric-container' style='border-color:#2ea043'><div class='label-sm acc-buy'>BUY LIMIT (L2)</div><div class='value-lg'>{d['l2']:.4f}</div></div>", unsafe_allow_html=True)
-        with k2: st.markdown(f"<div class='metric-container' style='text-align:center'><div class='label-sm'>MEAN TARGET</div><div class='value-lg' style='color:#58a6ff'>{d['ml']:.4f}</div></div>", unsafe_allow_html=True)
-        with k3: st.markdown(f"<div class='metric-container' style='border-color:#da3633'><div class='label-sm acc-sell'>SELL LIMIT (U2)</div><div class='value-lg'>{d['u2']:.4f}</div></div>", unsafe_allow_html=True)
+        with k1: st.markdown(f"<div class='metric-container' style='border-color:#2ea043'><div class='label-sm acc-buy'>BUY LIMIT</div><div class='value-lg'>{d['l2']:.4f}</div></div>", unsafe_allow_html=True)
+        with k2: st.markdown(f"<div class='metric-container' style='text-align:center'><div class='label-sm acc-info'>MEAN</div><div class='value-lg'>{d['ml']:.4f}</div></div>", unsafe_allow_html=True)
+        with k3: st.markdown(f"<div class='metric-container' style='border-color:#da3633'><div class='label-sm acc-sell'>SELL LIMIT</div><div class='value-lg'>{d['u2']:.4f}</div></div>", unsafe_allow_html=True)
+
+# [ 03 ] CLUSTERS
+with t_clus:
+    if target in st.session_state.state:
+        d = st.session_state.state[target]['best']
+        stack = st.session_state.state[target]['stack']
+        
+        st.subheader(f"{target} RESONANCE WALLS")
+        st.markdown("Top 10 overlapping levels from 1-60m cycles.")
+        
+        u_p = sorted([x['u2'] for x in stack])[-10:]
+        l_p = sorted([x['l2'] for x in stack])[:10]
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"<div class='metric-container' style='border-left:4px solid #da3633'><div class='label-sm'>RESISTANCE (SHORT)</div><div class='value-lg'>{d['clus_u2']:.4f}</div></div>", unsafe_allow_html=True)
+            for p in u_p: st.markdown(f"<div style='color:#da3633; font-family:monospace; padding:2px'>{p:.4f}</div>", unsafe_allow_html=True)
+        with c2:
+            st.markdown(f"<div class='metric-container' style='border-left:4px solid #2ea043'><div class='label-sm'>SUPPORT (LONG)</div><div class='value-lg'>{d['clus_l2']:.4f}</div></div>", unsafe_allow_html=True)
+            for p in l_p: st.markdown(f"<div style='color:#2ea043; font-family:monospace; padding:2px'>{p:.4f}</div>", unsafe_allow_html=True)
+
+# [ 04 ] OPTION LAB
+with t_opt:
+    if target in st.session_state.state:
+        d = st.session_state.state[target]['best']
+        
+        bs = OptionMath(d['price'], d['price'], 7/365, 0.04, d['hv']/100)
+        vol_state = "HIGH" if d['hv'] > 50 else "LOW"
+        
+        strat = "IRON CONDOR"
+        if d['rvol'] > 3.0: strat = "LONG STRADDLE"
+        elif d['signal'] == "BUY": strat = "BULL PUT SPREAD" if vol_state=="HIGH" else "LONG CALL"
+        elif d['signal'] == "SELL": strat = "BEAR CALL SPREAD" if vol_state=="HIGH" else "LONG PUT"
+        
+        st.subheader("STRATEGY ARCHITECT")
+        
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            st.markdown(f"""
+            <div class='metric-container' style='border-left: 4px solid #a371f7'>
+                <div class='label-sm acc-info'>{vol_state} VOLATILITY PLAN</div>
+                <div class='value-lg'>{strat}</div>
+                <div class='label-sm' style='margin-top:10px'>SHORT PUT STRIKE: <span class='acc-buy'>{d['clus_l2']:.2f}</span></div>
+                <div class='label-sm'>SHORT CALL STRIKE: <span class='acc-sell'>{d['clus_u2']:.2f}</span></div>
+            </div>""", unsafe_allow_html=True)
+        
+        with c2:
+             st.markdown(f"""
+            <div class='metric-container'>
+                <div class='label-sm'>ATM GREEKS (7D)</div><br>
+                <div style='display:flex;justify-content:space-between'><span>DELTA</span><span>0.50</span></div>
+                <div style='display:flex;justify-content:space-between'><span>THETA</span><span class='acc-sell'>{bs.theta():.2f}</span></div>
+            </div>""", unsafe_allow_html=True)

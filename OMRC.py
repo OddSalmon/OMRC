@@ -2,11 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Конфигурация интерфейса ---
-st.set_page_config(page_title="MRC v37.0 | Full Pro", layout="wide")
+st.set_page_config(page_title="MRC v37.1 | Stable Pro", layout="wide")
 
 st.markdown("""
     <style>
@@ -44,13 +45,13 @@ def ss_filter(data, l):
     return res
 
 def calculate_mrc_engine(df, length=200, mult=2.4):
+    if df is None or df.empty or 'close' not in df.columns: return df
     effective_length = length if len(df) > length + 10 else max(10, len(df) - 5)
     src = (df['high'] + df['low'] + df['close']) / 3
     tr = np.maximum(df['high'] - df['low'], np.maximum(abs(df['high'] - df['close'].shift(1)), abs(df['low'] - df['close'].shift(1)))).fillna(0)
     
     df['ml'] = ss_filter(src.values, effective_length)
     mr = ss_filter(tr.values, effective_length)
-    # Защита от нулевой волатильности (ZEC fix)
     mr_safe = np.maximum(mr, src.values * 0.0005)
     
     df['u2'] = df['ml'] + (mr_safe * np.pi * mult)
@@ -68,17 +69,20 @@ def calculate_mrc_engine(df, length=200, mult=2.4):
     df['rvol'] = df['vol'] / (df['vol'].rolling(20).mean() + 1e-9)
     return df
 
-# --- API ---
+# --- API Модуль ---
 @st.cache_data(ttl=600)
 def get_tokens_base():
-    r = requests.post(HL_URL, json={"type": "metaAndAssetCtxs"}).json()
-    return pd.DataFrame([{'name': a['name'], 'vol': float(c['dayNtlVlm']), 'funding': float(c['funding'])} for a, c in zip(r[0]['universe'], r[1])]).sort_values(by='vol', ascending=False)
+    try:
+        r = requests.post(HL_URL, json={"type": "metaAndAssetCtxs"}).json()
+        return pd.DataFrame([{'name': a['name'], 'vol': float(c['dayNtlVlm']), 'funding': float(c['funding'])} for a, c in zip(r[0]['universe'], r[1])]).sort_values(by='vol', ascending=False)
+    except: return pd.DataFrame(columns=['name', 'vol', 'funding'])
 
 def fetch_candles(coin, interval="1m", days=4):
     start_ts = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
     payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "startTime": start_ts}}
     try:
-        r = requests.post(HL_URL, json=payload, timeout=10).json()
+        r = requests.post(HL_URL, json=payload, timeout=15).json()
+        if not isinstance(r, list): return pd.DataFrame() # Защита от ошибок API
         df = pd.DataFrame(r).rename(columns={'t':'ts','o':'open','h':'high','l':'low','c':'close','v':'vol'})
         for c in ['open','high','low','close','vol']: df[c] = df[c].astype(float)
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
@@ -86,42 +90,38 @@ def fetch_candles(coin, interval="1m", days=4):
     except: return pd.DataFrame()
 
 @st.cache_data(ttl=600, show_spinner=False)
-def get_comprehensive_context(coin):
-    df_1m = fetch_candles(coin, "1m", 4)
-    df_1d = fetch_candles(coin, "1d", 300)
-    if df_1m.empty or df_1d.empty: return None
-    
-    df_daily = calculate_mrc_engine(df_1d)
-    d_last = df_daily.iloc[-1]
-    
-    # Часовой RVOL
-    df_1h = df_1m.set_index('ts').resample('1H').agg({'vol':'sum'}).tail(20)
-    h_rvol = df_1h['vol'].iloc[-1] / (df_1h['vol'].mean() + 1e-9)
-    
-    return {
-        "d_ml": d_last['ml'], "d_u2": d_last['u2'], "d_l2": d_last['l2'], "d_rvol": d_last['rvol'],
-        "h_rvol": h_rvol, "price": df_1m.iloc[-1]['close']
-    }
+def get_daily_context(coin):
+    df_d = fetch_candles(coin, interval="1d", days=300)
+    if df_d.empty or len(df_d) < 30: return None
+    df_m = calculate_mrc_engine(df_d)
+    last = df_m.iloc[-1]
+    return {"d_ml": last['ml'], "d_u2": last['u2'], "d_l2": last['l2'], "d_rvol": last['rvol']}
 
 @st.cache_data(ttl=600, show_spinner=False)
-def optimize_full_pro(coin):
-    ctx = get_comprehensive_context(coin)
-    if not ctx: return None
+def run_optimization_pro(coin):
     df_1m = fetch_candles(coin, "1m", 4)
-    best = {"score": -1, "tf": 15, "status": "—", "d_dist": 99.0}
+    if df_1m.empty or 'ts' not in df_1m.columns: return None
     
-    p = ctx['price']
-    best['d_dist'] = min(abs(p - ctx['d_l2'])/p, abs(p - ctx['d_u2'])/p) * 100
+    daily = get_daily_context(coin)
+    best = {"score": -1, "tf": 15, "status": "—", "d_dist": 99.0, "d_rvol": daily['d_rvol'] if daily else 0.0}
+    
+    curr_price = df_1m.iloc[-1]['close']
+    if daily:
+        best['d_dist'] = min(abs(curr_price - daily['d_l2'])/curr_price, abs(curr_price - daily['d_u2'])/curr_price) * 100
 
     for tf in range(1, 61):
         df_tf = df_1m.set_index('ts').resample(f'{tf}T').agg({'open':'first','high':'max','low':'min','close':'last','vol':'sum'}).dropna().reset_index()
         if len(df_tf) < 250: continue
         df_m = calculate_mrc_engine(df_tf)
+        if df_m is None or 'ml' not in df_m.columns: continue
+        
         slice_df = df_m.tail(300)
         sigs = list(slice_df[slice_df['high'] >= slice_df['u2']].index) + list(slice_df[slice_df['low'] <= slice_df['l2']].index)
         if len(sigs) < 2: continue
+        
         revs = sum(1 for idx in sigs if (df_m.loc[idx:idx+20]['low'] <= df_m.loc[idx]['ml']).any() or (df_m.loc[idx:idx+20]['high'] >= df_m.loc[idx]['ml']).any())
         score = (revs / len(sigs)) * np.sqrt(len(sigs))
+        
         if score > best['score']:
             last = df_m.iloc[-1]
             st_val = "—"
@@ -130,18 +130,19 @@ def optimize_full_pro(coin):
             best.update({
                 "coin": coin, "tf": tf, "score": score, "rev": revs/len(sigs), "status": st_val,
                 "rsi": last['rsi'], "zscore": last['zscore'], "stoch": last['stoch_rsi'], "rvol": last['rvol'],
-                "h_rvol": ctx['h_rvol'], "d_rvol": ctx['d_rvol'], "d_u2": ctx['d_u2'], "d_l2": ctx['d_l2'], "d_ml": ctx['d_ml']
+                "d_u2": daily['d_u2'] if daily else 0, "d_l2": daily['d_l2'] if daily else 0, "d_ml": daily['d_ml'] if daily else 0
             })
     return best
 
-# --- UI ---
-t_df = get_tokens_base()
+# --- Инициализация состояния ---
 if "pro_cache" not in st.session_state: st.session_state.pro_cache = {}
 
+# --- UI ---
+tokens_df = get_top_tokens_base()
 tab1, tab2 = st.tabs(["🎯 РЫНОЧНЫЙ СКАНЕР", "🔍 ПОЛНЫЙ АНАЛИЗ"])
 
 with tab1:
-    st.subheader("Масштабируемый сканер (Синхронизация ТФ)")
+    st.subheader("Модуль рыночного сканирования")
     cols = st.columns(5)
     counts = [10, 30, 50, 100, 120]
     triggered = None
@@ -149,12 +150,13 @@ with tab1:
         if col.button(f"TOP-{counts[i]}"): triggered = counts[i]
 
     if triggered:
-        coins = t_df['name'].head(triggered).tolist()
+        coins = tokens_df['name'].head(triggered).tolist()
         needed = [c for c in coins if c not in st.session_state.pro_cache]
         if needed:
             bar = st.progress(0)
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                futures = {executor.submit(optimize_full_pro, c): c for c in needed}
+            # Уменьшили кол-во потоков до 6 для стабильности RAM на 120 монетах
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                futures = {executor.submit(run_optimization_pro, c): c for c in needed}
                 for i, f in enumerate(as_completed(futures)):
                     r = f.result()
                     if r: st.session_state.pro_cache[r['coin']] = r
@@ -163,78 +165,82 @@ with tab1:
         final = [st.session_state.pro_cache[c] for c in coins if c in st.session_state.pro_cache]
         if final:
             res_df = pd.DataFrame(final)
-            st.dataframe(res_df[['coin', 'tf', 'status', 'rev', 'zscore', 'rvol', 'h_rvol', 'd_dist']].style.format(precision=2), use_container_width=True)
+            st.dataframe(res_df[['coin', 'tf', 'status', 'rev', 'zscore', 'rvol', 'd_dist']].style.format(precision=2), use_container_width=True)
+
+    if st.button("🔄 ПОЛНЫЙ СБРОС ДАННЫХ"):
+        st.session_state.pro_cache = {}
+        st.cache_data.clear()
+        st.rerun()
 
 with tab2:
-    target = st.selectbox("Актив для глубокого анализа", t_df['name'].tolist())
-    if st.button(f"ВЫПОЛНИТЬ РАСЧЕТ {target}") or target in st.session_state.pro_cache:
+    target = st.selectbox("Актив для анализа", tokens_df['name'].tolist())
+    if st.button(f"АНАЛИЗИРОВАТЬ {target}") or target in st.session_state.pro_cache:
         if target not in st.session_state.pro_cache:
             with st.spinner("Индивидуальная оптимизация..."):
-                st.session_state.pro_cache[target] = optimize_full_pro(target)
+                st.session_state.pro_cache[target] = run_optimization_pro(target)
         
         q = st.session_state.pro_cache[target]
-        df_raw = fetch_candles(target)
-        df_tf = df_raw.set_index('ts').resample(f"{q['tf']}T").agg({'open':'first','high':'max','low':'min','close':'last','vol':'sum'}).dropna().reset_index()
-        df = calculate_mrc_engine(df_tf)
-        last = df.iloc[-1]
-        funding = t_df[t_df['name']==target]['funding'].values[0]
+        if q and "tf" in q:
+            df_raw = fetch_candles(target)
+            if not df_raw.empty and 'ts' in df_raw.columns:
+                df_tf = df_raw.set_index('ts').resample(f"{q['tf']}T").agg({'open':'first','high':'max','low':'min','close':'last','vol':'sum'}).dropna().reset_index()
+                df = calculate_mrc_engine(df_tf)
+                last = df.iloc[-1]
+                funding = tokens_df[tokens_df['name']==target]['funding'].values[0]
 
-        # 1. Глобальный горизонт
-        st.markdown(f"""
-        <div class='daily-section'>
-            <div style='color: #58a6ff; font-weight: bold; margin-bottom: 10px;'>📅 DAILY HORIZON (ГЛОБАЛЬНЫЙ ТРЕНД)</div>
-            <div style='display: flex; justify-content: space-between;'>
-                <div><div class='level-label'>DAILY SELL (U2)</div><div class='level-price'>{q['d_u2']:.4f}</div></div>
-                <div><div class='level-label'>DAILY MEAN (ML)</div><div class='level-price'>{q['d_ml']:.4f}</div></div>
-                <div><div class='level-label'>DAILY BUY (L2)</div><div class='level-price'>{q['d_l2']:.4f}</div></div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+                # 1. Глобальный горизонт
+                st.markdown(f"""
+                <div class='daily-section'>
+                    <div style='color: #58a6ff; font-weight: bold; margin-bottom: 10px;'>📅 DAILY HORIZON (ГЛОБАЛЬНЫЙ ТРЕНД)</div>
+                    <div style='display: flex; justify-content: space-between;'>
+                        <div><div class='level-label'>DAILY SELL (U2)</div><div class='level-price'>{q.get('d_u2',0):.4f}</div></div>
+                        <div><div class='level-label'>DAILY MEAN (ML)</div><div class='level-price'>{q.get('d_ml',0):.4f}</div></div>
+                        <div><div class='level-label'>DAILY BUY (L2)</div><div class='level-price'>{q.get('d_l2',0):.4f}</div></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
-        # 2. Объемы
-        st.markdown("<div class='volume-section'><div style='font-weight: bold; color: #fbbf24; margin-bottom: 10px;'>📊 ТРОЙНОЙ АНАЛИЗ ОБЪЕМОВ (RVOL)</div>", unsafe_allow_html=True)
-        v1, v2, v3 = st.columns(3)
-        v1.metric("Локальный (ТФ)", f"{q['rvol']:.2f}x")
-        v2.metric("Часовой (1H)", f"{q['h_rvol']:.2f}x")
-        v3.metric("Дневной (1D)", f"{q['d_rvol']:.2f}x")
-        st.markdown("</div>", unsafe_allow_html=True)
+                # 2. Объемы
+                st.markdown("<div class='volume-section'><div style='font-weight: bold; color: #fbbf24; margin-bottom: 10px;'>📊 ТРОЙНОЙ АНАЛИЗ ОБЪЕМОВ (RVOL)</div>", unsafe_allow_html=True)
+                v1, v2 = st.columns(2)
+                v1.metric(f"Локальный ({q['tf']}м)", f"{last['rvol']:.2f}x")
+                v2.metric("Дневной (1D)", f"{q.get('d_rvol',0):.2f}x")
+                st.markdown("</div>", unsafe_allow_html=True)
 
-        # 3. Метрики Интеллекта
-        st.write(f"### Локальный резонанс | Таймфрейм: **{q['tf']}м**")
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            st.metric("Z-Score", f"{last['zscore']:.2f}σ")
-            st.markdown("<div class='metric-subtext'><b>Отклонение</b>. Выше 2.0σ — математическая аномалия.</div>", unsafe_allow_html=True)
-        with m2:
-            st.metric("Stoch RSI", f"{last['stoch_rsi']*100:.1f}%")
-            st.markdown("<div class='metric-subtext'><b>Триггер</b>. Разворот из зон 0% или 100% дает сигнал к входу.</div>", unsafe_allow_html=True)
-        with m3:
-            st.metric("RSI (14)", f"{last['rsi']:.1f}")
-            st.markdown("<div class='metric-subtext'><b>Сила тренда</b>. Подтверждает перегрев актива.</div>", unsafe_allow_html=True)
-        with m4:
-            st.metric("Funding APR", f"{funding*24*365*100:.1f}%")
-            st.markdown("<div class='metric-subtext'><b>Сентимент</b>. Прямая стоимость удержания позиции.</div>", unsafe_allow_html=True)
+                # 3. Метрики
+                st.write(f"### Анализ {target} | Подобраный ТФ: **{q['tf']}м**")
+                m1, m2, m3, m4 = st.columns(4)
+                with m1:
+                    st.metric("Z-Score", f"{last['zscore']:.2f}σ")
+                    st.markdown("<div class='metric-subtext'><b>Отклонение</b>. Выше 2.0σ — математическая аномалия.</div>", unsafe_allow_html=True)
+                with m2:
+                    st.metric("Stoch RSI", f"{last['stoch_rsi']*100:.1f}%")
+                    st.markdown("<div class='metric-subtext'><b>Триггер</b>. Разворот из зон 0% или 100% дает сигнал к входу.</div>", unsafe_allow_html=True)
+                with m3:
+                    st.metric("RSI (14)", f"{last['rsi']:.1f}")
+                    st.markdown("<div class='metric-subtext'><b>Сила тренда</b>. Подтверждает перегрев актива.</div>", unsafe_allow_html=True)
+                with m4:
+                    st.metric("Funding APR", f"{funding*24*365*100:.1f}%")
+                    st.markdown("<div class='metric-subtext'><b>Сентимент</b>. Прямая стоимость удержания позиции.</div>", unsafe_allow_html=True)
 
-        # 4. Умный Вердикт
-        v_status, v_msg, v_color = "—", "Ожидание условий", "#30363d"
-        if q['rvol'] > 4.0 or q['h_rvol'] > 4.0:
-            v_status, v_msg, v_color = "⚠️ ИМПУЛЬС", "Высокий риск пробоя из-за всплеска объема. Подождите.", "#451a03"
-        elif q['status'] == "🟢 BUY":
-            v_status, v_msg, v_color = "✅ LONG", f"Покупаем от L2. Вероятность: {q['rev']*100:.0f}%", "#1c2a1e"
-        elif q['status'] == "🔴 SELL":
-            if last['close'] < q['d_u2'] * 0.98 and q['h_rvol'] > 2.0:
-                v_status, v_msg, v_color = "⏳ ЖДАТЬ", "Тренд силен. Безопаснее ждать касания Daily U2.", "#451a03"
+                # 4. Вердикт
+                v_status, v_msg, v_color = "—", "Ожидание условий", "#30363d"
+                if q['rvol'] > 4.0: v_status, v_msg, v_color = "⚠️ ИМПУЛЬС", "Высокий риск пробоя. Ждите.", "#451a03"
+                elif q['status'] == "🟢 BUY": v_status, v_msg, v_color = "✅ LONG", "Вход от L2", "#1c2a1e"
+                elif q['status'] == "🔴 SELL": v_status, v_msg, v_color = "✅ SHORT", "Вход от U2", "#2a1c1c"
+                st.markdown(f"<div class='verdict-box' style='background-color: {v_color};'>ВЕРДИКТ: {v_status} | {v_msg}</div>", unsafe_allow_html=True)
+
+                # 5. Карточки
+                cl, cm, cs = st.columns([1, 1, 1])
+                with cl:
+                    st.markdown(f"<div class='entry-card-long'><div class='level-label'>ЛОКАЛЬНЫЙ BUY (L2)</div><div class='level-price'>{last['l2']:.4f}</div></div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='stop-card'><div class='level-label'>LONG STOP (ATR)</div><div style='color: #da3633; font-weight: bold;'>{last['l2'] - last['atr']:.4f}</div></div>", unsafe_allow_html=True)
+                with cm:
+                    st.markdown(f"<div class='target-card'><div style='color: #58a6ff; font-weight: bold;'>💎 ТЕЙК-ПРОФИТ</div><div class='level-price' style='color: #58a6ff;'>{last['ml']:.4f}</div></div>", unsafe_allow_html=True)
+                with cs:
+                    st.markdown(f"<div class='entry-card-short'><div class='level-label'>ЛОКАЛЬНЫЙ SELL (U2)</div><div class='level-price'>{last['u2']:.4f}</div></div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='stop-card'><div class='level-label'>SHORT STOP (ATR)</div><div style='color: #da3633; font-weight: bold;'>{last['u2'] + last['atr']:.4f}</div></div>", unsafe_allow_html=True)
             else:
-                v_status, v_msg, v_color = "✅ SHORT", f"Продаем от U2. Вероятность: {q['rev']*100:.0f}%", "#2a1c1c"
-        st.markdown(f"<div class='verdict-box' style='background-color: {v_color}; border-color: #58a6ff;'>ИТОГОВЫЙ ВЕРДИКТ: {v_status} | {v_msg}</div>", unsafe_allow_html=True)
-
-        # 5. Карточки исполнения
-        cl, cm, cs = st.columns([1, 1, 1])
-        with cl:
-            st.markdown(f"<div class='entry-card-long'><div class='level-label'>ЛОКАЛЬНЫЙ BUY (L2)</div><div class='level-price'>{last['l2']:.4f}</div></div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='stop-card'><div class='level-label'>LONG STOP (ATR)</div><div style='color: #da3633; font-weight: bold;'>{last['l2'] - last['atr']:.4f}</div></div>", unsafe_allow_html=True)
-        with cm:
-            st.markdown(f"<div class='target-card'><div style='color: #58a6ff; font-weight: bold;'>💎 ТЕЙК-ПРОФИТ (MEAN)</div><div class='level-price' style='color: #58a6ff;'>{last['ml']:.4f}</div><div class='level-label' style='margin-top:10px;'>ОЖИДАНИЕ</div><div style='font-size: 1.2rem; font-weight: bold;'>~{int(q['rev']*20)} баров</div></div>", unsafe_allow_html=True)
-        with cs:
-            st.markdown(f"<div class='entry-card-short'><div class='level-label'>ЛОКАЛЬНЫЙ SELL (U2)</div><div class='level-price'>{last['u2']:.4f}</div></div>", unsafe_allow_html=True)
-            st.markdown(f"<div class='stop-card'><div class='level-label'>SHORT STOP (ATR)</div><div style='color: #da3633; font-weight: bold;'>{last['u2'] + last['atr']:.4f}</div></div>", unsafe_allow_html=True)
+                st.error("Ошибка: Данные по активу не получены. Попробуйте еще раз.")
+        else:
+            st.info("Выполните расчет для отображения данных.")

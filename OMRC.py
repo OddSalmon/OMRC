@@ -4,26 +4,55 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from scipy.stats import norm
 
-# --- Pro Theme ---
-st.set_page_config(page_title="MRC Terminal v48", layout="wide")
+# --- Industrial Config ---
+st.set_page_config(page_title="MRC v51 | OKX Lab", layout="wide")
 st.markdown("""
     <style>
-    .stApp { background-color: #0d1117; color: #c9d1d9; }
-    .stMetric { background-color: #161b22; border: 1px solid #30363d; border-radius: 4px; padding: 12px; }
-    .card-buy { background-color: #1c2a1e; border: 1px solid #2ea043; border-radius: 4px; padding: 15px; margin-bottom: 10px; }
-    .card-sell { background-color: #2a1c1c; border: 1px solid #da3633; border-radius: 4px; padding: 15px; margin-bottom: 10px; }
-    .card-info { background-color: #161b22; border: 1px solid #30363d; border-radius: 4px; padding: 15px; margin-bottom: 10px; }
-    .price-text { font-size: 1.5rem; font-weight: 700; font-family: 'Roboto Mono', monospace; }
-    .label-text { font-size: 0.8rem; color: #8b949e; text-transform: uppercase; }
-    .desc-text { font-size: 0.85rem; color: #8b949e; line-height: 1.4; margin-top: 5px; }
-    .doc-box { background-color: #0d141d; border-radius: 6px; padding: 15px; border: 1px solid #1f6feb; margin-bottom: 20px; font-size: 0.9rem; }
+    .stApp { background-color: #0b0e11; color: #e1e1e1; font-family: 'Roboto', sans-serif; }
+    .stMetric { background-color: #151a21; border: 1px solid #2a3038; border-radius: 4px; padding: 12px; }
+    .card-call { background-color: #1a221c; border-left: 4px solid #4ca865; padding: 15px; margin-bottom: 10px; border-radius: 4px; }
+    .card-put { background-color: #261a1a; border-left: 4px solid #db4c4c; padding: 15px; margin-bottom: 10px; border-radius: 4px; }
+    .card-lab { background-color: #151a21; border: 1px solid #2a3038; padding: 15px; margin-bottom: 10px; border-radius: 4px; }
+    .mono { font-family: 'Roboto Mono', monospace; }
+    .label { font-size: 0.75rem; color: #8492a6; text-transform: uppercase; letter-spacing: 0.5px; }
+    .value { font-size: 1.2rem; font-weight: 600; color: #ffffff; }
+    .highlight { color: #5d87ff; }
+    /* Table Fixes */
+    thead tr th:first-child { display:none }
+    tbody th { display:none }
     </style>
 """, unsafe_allow_html=True)
 
-API_URL = "https://api.hyperliquid.xyz/info"
+API_URL = "https://api.hyperliquid.xyz/info" # Fallback for Spot Data
 
-# --- Core Math ---
+# --- Black-Scholes Engine ---
+class OptionMath:
+    def __init__(self, S, K, T, r, sigma):
+        self.S = S  # Underlying Price
+        self.K = K  # Strike Price
+        self.T = T  # Time to Expiration (years)
+        self.r = r  # Risk-free rate
+        self.sigma = sigma # Volatility
+        
+        self.d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+        self.d2 = self.d1 - sigma*np.sqrt(T)
+
+    def call_price(self):
+        return self.S * norm.cdf(self.d1) - self.K * np.exp(-self.r*self.T) * norm.cdf(self.d2)
+
+    def put_price(self):
+        return self.K * np.exp(-self.r*self.T) * norm.cdf(-self.d2) - self.S * norm.cdf(-self.d1)
+
+    def call_delta(self): return norm.cdf(self.d1)
+    def put_delta(self): return norm.cdf(self.d1) - 1
+    def gamma(self): return norm.pdf(self.d1) / (self.S * self.sigma * np.sqrt(self.T))
+    def vega(self): return self.S * norm.pdf(self.d1) * np.sqrt(self.T) / 100
+    def theta(self): 
+        return (- (self.S * norm.pdf(self.d1) * self.sigma) / (2 * np.sqrt(self.T)) - self.r * self.K * np.exp(-self.r*self.T) * norm.cdf(self.d2)) / 365
+
+# --- Data Engine ---
 def super_smoother(data, length):
     if len(data) < 3: return data
     res = np.zeros_like(data)
@@ -48,15 +77,17 @@ def get_mrc_pro(df, length=200, mult=2.4):
     df['zscore'] = (df['close'] - df['ml']) / (df['close'].rolling(eff_l).std() + 1e-9)
     df['rvol'] = df['vol'] / (df['vol'].rolling(20).mean() + 1e-9)
     df['atr'] = tr.rolling(14).mean()
+    # Historical Volatility (30D annualized)
+    df['hv'] = np.log(df['close']/df['close'].shift(1)).rolling(30).std() * np.sqrt(365*24*60) * 100
     return df
 
-# --- API ---
 @st.cache_data(ttl=300)
-def get_meta():
-    try:
-        r = requests.post(API_URL, json={"type": "metaAndAssetCtxs"}).json()
-        return pd.DataFrame([{'name': a['name'], 'v24h': float(c['dayNtlVlm'])} for a, c in zip(r[0]['universe'], r[1])]).sort_values('v24h', ascending=False)
-    except: return pd.DataFrame()
+def get_okx_tickers():
+    # Only BTC/ETH for Options Lab
+    return pd.DataFrame([
+        {'name': 'BTC', 'v24h': 1000000},
+        {'name': 'ETH', 'v24h': 500000}
+    ])
 
 def fetch_data(coin, days=4):
     ts = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
@@ -69,131 +100,185 @@ def fetch_data(coin, days=4):
         return df.sort_values('ts')
     except: return pd.DataFrame()
 
-# --- V8 Resonance Engine ---
+# --- V8 Optimization ---
 @st.cache_data(ttl=600, show_spinner=False)
-def brute_force_resonance(coin):
-    raw = fetch_data(coin)
+def v8_lab_engine(coin):
+    raw = fetch_data(coin, days=15) # More data for HV
     if raw.empty: return None
     raw = raw.set_index('ts')
     
-    df_d = fetch_data(coin, days=15)
-    d_range = ((df_d['high'] - df_d['low']) / df_d['close']).mean() * 100 if not df_d.empty else 0
+    current_hv = raw['close'].pct_change().rolling(24*60).std() * np.sqrt(365*24*60) * 100
+    if pd.isna(current_hv.iloc[-1]): current_hv = 40.0 # Fallback
+    else: current_hv = current_hv.iloc[-1]
 
     best = {"score": -1, "tf": 0, "signal": "—"}
     stack = []
     
-    for tf in range(1, 61): # FULL 1-60m SEARCH
+    for tf in range(1, 61):
         df_tf = raw.resample(f'{tf}min').agg({'open':'first','high':'max','low':'min','close':'last','vol':'sum'}).dropna().reset_index()
-        if len(df_tf) < 120: continue
+        if len(df_tf) < 100: continue
         df_m = get_mrc_pro(df_tf)
         if df_m is None: continue
         
         last = df_m.iloc[-1]
-        stack.append({"tf": tf, "u2": last['u2'], "l2": last['l2'], "ml": last['ml']})
+        stack.append(last['u2'])
+        stack.append(last['l2'])
         
-        # Win-Rate Calculation
-        sigs_df = df_m[(df_m['high'] >= df_m['u2']) | (df_m['low'] <= df_m['l2'])]
-        sigs = sigs_df.index.tolist()
-        if len(sigs) < 4: continue # Statistical Filter: min 4 signals required
+        sigs = df_m[(df_m['high'] >= df_m['u2']) | (df_m['low'] <= df_m['l2'])].index
+        if len(sigs) < 5: continue
         
         hits = 0
-        for idx in sigs[:-1]: # Exclude current active signal
-            fut = df_m.loc[idx:idx+25] # 25 bar window for reversion
+        for idx in sigs[:-1]:
+            fut = df_m.loc[idx:idx+25]
             if (fut['low'] <= df_m.loc[idx, 'ml']).any() and (fut['high'] >= df_m.loc[idx, 'ml']).any():
                 hits += 1
         
         prob = hits / len(sigs)
-        # CALIBRATED SCORE: penalizes ultra-low TFs to avoid noise, favors stability
-        # tf**0.2 provides a slight push to move away from 1m unless it is significantly more accurate.
-        score = prob * np.log10(len(sigs)) * (tf ** 0.15) 
+        score = prob * np.log10(len(sigs)) * (tf ** 0.15)
         
         if score > best['score']:
+            sig = "—"
+            if last['close'] >= last['u2']: sig = "SELL"
+            elif last['close'] <= last['l2']: sig = "BUY"
+            
             best.update({
-                "coin": coin, "tf": tf, "prob": prob, "signal": "SELL" if last['close'] >= last['u2'] else "BUY" if last['close'] <= last['l2'] else "—",
-                "zscore": last['zscore'], "rvol": last['rvol'], "d_range": d_range,
-                "ml": last['ml'], "u2": last['u2'], "l2": last['l2'], "atr": last['atr'], "score": score
+                "coin": coin, "tf": tf, "prob": prob, "signal": sig,
+                "price": last['close'], "hv": current_hv,
+                "u2": last['u2'], "l2": last['l2'], "ml": last['ml'],
+                "zscore": last['zscore'], "rvol": last['rvol']
             })
             
-    return {"best": best, "stack": stack} if best['tf'] > 0 else None
-
-# --- UI Interface ---
-if "store" not in st.session_state: st.session_state.store = {}
-tab_scan, tab_anal, tab_clusters = st.tabs(["MARKET SCANNER", "ANALYSIS", "RESONANCE CLUSTERS"])
-
-with tab_scan:
-    st.markdown("""<div class='doc-box'><b>Column Reference:</b><br>
-    • <b>TF:</b> Optimal cycle (1-60m) determined by historical hit-rate and stability.<br>
-    • <b>SIGNAL:</b> BUY/SELL trigger at statistical boundaries (L2/U2).<br>
-    • <b>RVOL:</b> Relative Volume. Values > 3.5x indicate heavy momentum (Breakout Alert).<br>
-    • <b>PROB:</b> Percentage of historical boundary touches that successfully returned to the mean.</div>""", unsafe_allow_html=True)
+    # Calculate Cluster Walls from Stack
+    stack.sort()
+    cluster_l2 = np.mean(stack[:10]) # Avg of lowest supports
+    cluster_u2 = np.mean(stack[-10:]) # Avg of highest resistance
     
-    cols = st.columns(5)
-    ranges = [10, 30, 50, 100, 120]
-    trigger = None
-    for i, c in enumerate(cols):
-        if c.button(f"TOP {ranges[i]}"): trigger = ranges[i]
-        
-    if trigger:
-        meta = get_meta().head(trigger)
-        bar = st.progress(0)
-        results_list = []
-        with ThreadPoolExecutor(max_workers=4) as exc:
-            futures = {exc.submit(brute_force_resonance, name): name for name in meta['name'].tolist()}
-            for i, f in enumerate(as_completed(futures)):
-                res = f.result()
-                if res and "best" in res:
-                    st.session_state.store[res['best']['coin']] = res
-                    results_list.append(res['best'])
-                bar.progress((i+1)/len(meta))
-        
-        if results_list:
-            df_res = pd.DataFrame(results_list)[['coin', 'tf', 'signal', 'rvol', 'zscore', 'prob']]
-            st.table(df_res.sort_values('prob', ascending=False))
+    best['cluster_l2'] = cluster_l2
+    best['cluster_u2'] = cluster_u2
+    
+    return best
 
-with tab_anal:
-    target = st.selectbox("Select Asset", get_meta()['name'].tolist())
-    if st.button("CALCULATE MATH") or target in st.session_state.store:
-        if target not in st.session_state.store:
-            with st.spinner("Processing full 1-60m V8 optimization..."):
-                st.session_state.store[target] = brute_force_resonance(target)
-        
-        d = st.session_state.store[target]['best']
-        st.subheader(f"{target} | Optimized Cycle: {d['tf']}m")
-        
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("Z-Score", f"{d['zscore']:.2f}σ")
-            st.markdown("<div class='desc-text'><b>Z-Score:</b> Measures deviation. Reversion is mathematically likely when Z-Score > 2.0σ or < -2.0σ.</div>", unsafe_allow_html=True)
-        with c2:
-            st.metric("Relative Volume", f"{d['rvol']:.2f}x")
-            st.markdown(f"<div class='desc-text'><b>RVOL ({d['tf']}m):</b> Current vs Average Volume. <b>Warning:</b> If RVOL > 3.5x, the trend is too strong for reversal.</div>", unsafe_allow_html=True)
-        with c3:
-            st.metric("Success Rate", f"{d['prob']*100:.1f}%")
-            st.markdown("<div class='desc-text'><b>Historical Probability:</b> How often price returned to mean ($ML$) after touching $L2/U2$ on this TF.</div>", unsafe_allow_html=True)
-        with c4:
-            st.metric("Daily Range", f"{d['d_range']:.2f}%")
-            st.markdown("<div class='desc-text'><b>Volatility Intensity:</b> Average 24h range. Higher values require wider ATR stops.</div>", unsafe_allow_html=True)
+# --- UI ---
+if "lab_store" not in st.session_state: st.session_state.lab_store = {}
 
-        st.divider()
-        cl, cm, cs = st.columns(3)
-        with cl:
-            st.markdown(f"<div class='card-buy'><div class='label-text'>BUY LIMIT</div><div class='price-text'>{d['l2']:.4f}</div><div class='label-text'>Stop (ATR): {d['l2']-d['atr']:.4f}</div></div>", unsafe_allow_html=True)
-        with cm:
-            st.markdown(f"<div class='card-info' style='text-align:center'><div class='label-text'>TARGET (MEAN)</div><div class='price-text' style='color:#58a6ff'>{d['ml']:.4f}</div><div class='label-text'>Cycle Equilibrium</div></div>", unsafe_allow_html=True)
-        with cs:
-            st.markdown(f"<div class='card-sell'><div class='label-text'>SELL LIMIT</div><div class='price-text'>{d['u2']:.4f}</div><div class='label-text'>Stop (ATR): {d['u2']+d['atr']:.4f}</div></div>", unsafe_allow_html=True)
+# Sidebar for Asset Selection
+st.sidebar.markdown("## OKX Options Lab")
+target = st.sidebar.selectbox("Select Asset", ["BTC", "ETH"])
 
-with tab_clusters:
-    if target in st.session_state.store:
-        st.subheader(f"{target} Multi-Cycle Consensus")
-        st.markdown("<div class='desc-text'>Clusters identify levels where multiple 1–60m cycles align. These are the strongest statistical barriers in the market.</div>", unsafe_allow_html=True)
-        stack = st.session_state.store[target]['stack']
-        u_p = sorted([x['u2'] for x in stack])
-        l_p = sorted([x['l2'] for x in stack])
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("### RESISTANCE WALLS (U2)")
-            for p in u_p[-5:]: st.markdown(f"<div class='stMetric'><span class='price-text' style='color:#da3633'>{p:.4f}</span></div>", unsafe_allow_html=True)
-        with c2:
-            st.markdown("### SUPPORT WALLS (L2)")
-            for p in l_p[:5]: st.markdown(f"<div class='stMetric'><span class='price-text' style='color:#2ea043'>{p:.4f}</span></div>", unsafe_allow_html=True)
+if st.sidebar.button("INITIALIZE LAB"):
+    with st.spinner(f"Analyzing {target} Volatility Surface..."):
+        st.session_state.lab_store[target] = v8_lab_engine(target)
+
+# --- MAIN DASHBOARD ---
+if target in st.session_state.lab_store:
+    d = st.session_state.lab_store[target]
+    
+    # 1. Market Context Header
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Underlying Price", f"${d['price']:,.2f}")
+    c2.metric("Realized Vol (HV)", f"{d['hv']:.1f}%")
+    c3.metric("V8 Signal", d['signal'], delta=f"Prob: {d['prob']*100:.0f}%")
+    c4.metric("Cluster Skew", f"{(d['cluster_u2']/d['price'] - 1)*100:.1f}% / {(d['cluster_l2']/d['price'] - 1)*100:.1f}%")
+
+    st.divider()
+
+    # 2. Strategy Engine
+    st.subheader("🤖 Algorithmic Strategy Builder")
+    
+    # Determine Strategy Type
+    strategy_type = "NEUTRAL"
+    if d['signal'] == "BUY": strategy_type = "BULLISH"
+    elif d['signal'] == "SELL": strategy_type = "BEARISH"
+    
+    vol_regime = "LOW VOL" if d['hv'] < 45 else "HIGH VOL"
+    
+    col_strat, col_greeks = st.columns([2, 1])
+    
+    with col_strat:
+        # Strategy Logic Tree
+        if strategy_type == "NEUTRAL":
+            if vol_regime == "HIGH VOL":
+                strat_name = "IRON CONDOR (Short)"
+                desc = "Sell OTM Puts & Calls to collect premium. Price is mean-reverting."
+                leg1 = f"SELL PUT: {d['cluster_l2']:.0f}"
+                leg2 = f"SELL CALL: {d['cluster_u2']:.0f}"
+            else:
+                strat_name = "LONG STRADDLE / STRANGLE"
+                desc = "Buy OTM Puts & Calls. Expecting a breakout from low volatility."
+                leg1 = f"BUY PUT: {d['cluster_l2']:.0f}"
+                leg2 = f"BUY CALL: {d['cluster_u2']:.0f}"
+                
+        elif strategy_type == "BULLISH":
+            if vol_regime == "HIGH VOL":
+                strat_name = "BULL PUT SPREAD (Credit)"
+                desc = f"Sell Puts at Support Cluster. High Vol makes premium rich."
+                leg1 = f"SELL PUT: {d['cluster_l2']:.0f}"
+                leg2 = f"BUY PUT: {d['cluster_l2']*0.95:.0f} (Protection)"
+            else:
+                strat_name = "LONG CALL (Debit)"
+                desc = f"Buy Calls targeting Resistance Cluster. Low Vol makes options cheap."
+                leg1 = f"BUY CALL: {d['cluster_u2']:.0f} (Target)"
+                leg2 = "None"
+                
+        elif strategy_type == "BEARISH":
+            if vol_regime == "HIGH VOL":
+                strat_name = "BEAR CALL SPREAD (Credit)"
+                desc = f"Sell Calls at Resistance Cluster."
+                leg1 = f"SELL CALL: {d['cluster_u2']:.0f}"
+                leg2 = f"BUY CALL: {d['cluster_u2']*1.05:.0f} (Protection)"
+            else:
+                strat_name = "LONG PUT (Debit)"
+                desc = f"Buy Puts targeting Support Cluster."
+                leg1 = f"BUY PUT: {d['cluster_l2']:.0f} (Target)"
+                leg2 = "None"
+        
+        st.markdown(f"""
+        <div class='card-lab'>
+            <div class='label highlight'>{vol_regime} • {strategy_type}</div>
+            <div class='value'>{strat_name}</div>
+            <div class='desc-text'>{desc}</div>
+            <hr style='border-color:#2a3038'>
+            <div style='display:flex; justify-content:space-between'>
+                <div class='mono'>{leg1}</div>
+                <div class='mono'>{leg2}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Volatility Skew Visualizer (Simulated based on Clusters)
+        st.markdown("### 📊 Volatility Surface Proxy")
+        skew_data = pd.DataFrame({
+            "Strike": [d['cluster_l2']*0.9, d['cluster_l2'], d['price'], d['cluster_u2'], d['cluster_u2']*1.1],
+            "Implied Vol": [d['hv']*1.2, d['hv']*1.1, d['hv'], d['hv']*1.1, d['hv']*1.2] # Smile Curve
+        })
+        st.line_chart(skew_data.set_index("Strike"))
+
+    with col_greeks:
+        st.markdown("### 📐 Theoretical Greeks")
+        # Calculate Greeks for ATM Option
+        bs = OptionMath(S=d['price'], K=d['price'], T=7/365, r=0.04, sigma=d['hv']/100)
+        
+        st.markdown(f"""
+        <div class='card-lab'>
+            <div style='display:flex; justify-content:space-between; margin-bottom:5px'>
+                <span class='label'>DELTA (Direction)</span>
+                <span class='mono'>{bs.call_delta():.2f}</span>
+            </div>
+            <div style='display:flex; justify-content:space-between; margin-bottom:5px'>
+                <span class='label'>GAMMA (Acceleration)</span>
+                <span class='mono'>{bs.gamma():.4f}</span>
+            </div>
+            <div style='display:flex; justify-content:space-between; margin-bottom:5px'>
+                <span class='label'>THETA (Time Decay)</span>
+                <span class='mono' style='color:#da3633'>{bs.theta():.2f}</span>
+            </div>
+            <div style='display:flex; justify-content:space-between'>
+                <span class='label'>VEGA (Vol Sensitivity)</span>
+                <span class='mono'>{bs.vega():.2f}</span>
+            </div>
+        </div>
+        <div class='desc-text' style='text-align:center'>*Calculated for 7 DTE ATM Option</div>
+        """, unsafe_allow_html=True)
+
+else:
+    st.info("👈 Initialize the OKX Lab from the sidebar to start.")

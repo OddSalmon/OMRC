@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from scipy.stats import norm
 
 # --- INDUSTRIAL CONFIG ---
-st.set_page_config(page_title="MRC v59 | Classic V8", layout="wide")
+st.set_page_config(page_title="MRC v61 | TOP 50", layout="wide")
 st.markdown("""
     <style>
     .stApp { background-color: #0b0e11; color: #c9d1d9; font-family: 'Roboto', sans-serif; }
@@ -94,7 +94,7 @@ def get_metadata():
         return pd.DataFrame(data).sort_values('volume', ascending=False)
     except: return pd.DataFrame()
 
-def fetch_candles(coin, days=4): # Reduced to 4 days for speed/relevance
+def fetch_candles(coin, days=4):
     ts_start = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
     try:
         r = requests.post(API_URL, json={"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": ts_start}}, timeout=10).json()
@@ -105,14 +105,13 @@ def fetch_candles(coin, days=4): # Reduced to 4 days for speed/relevance
         return df.sort_values('ts')
     except: return pd.DataFrame()
 
-# --- 4. CLASSIC V8 ENGINE (RESTORED) ---
+# --- 4. CLASSIC V8 ENGINE (RAW MATH) ---
 @st.cache_data(ttl=600, show_spinner=False)
 def v8_optimizer(coin, funding):
     raw = fetch_candles(coin)
     if raw.empty: return None
     raw = raw.set_index('ts')
     
-    # Global Volatility (Annualized)
     current_hv = raw['close'].pct_change().rolling(1440).std() * np.sqrt(525600) * 100
     hv_val = current_hv.iloc[-1] if not pd.isna(current_hv.iloc[-1]) else 50.0
 
@@ -130,12 +129,12 @@ def v8_optimizer(coin, funding):
         last = df_m.iloc[-1]
         stack.append({'u2': last['u2'], 'l2': last['l2']})
         
-        # Valid Signals (Relaxed filter: min 3 signals)
+        # Valid Signals (Min 3 to avoid "1 lucky trade" trap)
         sigs = df_m[(df_m['high'] >= df_m['u2']) | (df_m['low'] <= df_m['l2'])].index
         if len(sigs) < 3: continue 
         
         # --- CLASSIC BACKTEST ---
-        # Fixed 20-bar lookahead. Reversion MUST happen fast.
+        # Fixed 20-bar lookahead. Reversion MUST be fast.
         lookahead_bars = 20
         hits = 0
         valid = 0
@@ -158,9 +157,9 @@ def v8_optimizer(coin, funding):
         if valid == 0: continue
         prob = hits / valid
         
-        # --- THE ORIGINAL SCORE FORMULA ---
-        # Balance Quality (Prob) and Quantity (Sqrt of signals)
-        # This naturally favors lower TFs (more signals) without over-weighting noise.
+        # --- THE HOLY GRAIL FORMULA ---
+        # Score = WinRate * Sqrt(Frequency)
+        # This naturally forces the engine to pick active timeframes (5m, 15m)
         score = prob * np.sqrt(valid)
         
         if score > best['score']:
@@ -198,8 +197,8 @@ t_scan, t_anal, t_clus, t_opt = st.tabs(["[ 01 // SCREENER ]", "[ 02 // ANALYSIS
 with t_scan:
     c1, c2 = st.columns([1, 4])
     with c1:
-        if st.button("SCAN TOP 15", use_container_width=True):
-            meta = get_metadata().head(15)
+        if st.button("SCAN TOP 50", use_container_width=True):
+            meta = get_metadata().head(50) # Updated to 50
             progress = st.progress(0)
             with ThreadPoolExecutor(max_workers=4) as exe:
                 futs = {exe.submit(v8_optimizer, r['name'], r['funding']): r['name'] for _, r in meta.iterrows()}
@@ -236,7 +235,7 @@ with t_scan:
 
 # [ 02 ] ANALYSIS
 with t_anal:
-    assets = list(st.session_state.state.keys()) if st.session_state.state else get_metadata()['name'].head(15).tolist()
+    assets = list(st.session_state.state.keys()) if st.session_state.state else get_metadata()['name'].head(50).tolist()
     target = st.selectbox("ASSET", assets)
     
     if st.button("DIAGNOSE") or target in st.session_state.state:

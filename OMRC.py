@@ -193,7 +193,7 @@ with tab2:
                 st.markdown(f"<div class='metric-subtext'><b>{'Экстремум' if (last['rsi']<30 or last['rsi']>70) else 'Норма'}</b>. Показывает силу текущего движения.</div>", unsafe_allow_html=True)
             with m2:
                 st.metric("Z-Score", f"{last['zscore']:.2f}σ")
-                st.markdown(f"<div class='metric-subtext'><b>Отклонение</b>. Значения выше 2.0σ считаются статистически аномальными.</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='metric-subtext'><b>Отклонение</b>. Значения выше 3.0σ считаются статистически аномальными.</div>", unsafe_allow_html=True)
             with m3:
                 st.metric("Stoch RSI", f"{last['stoch_rsi']*100:.1f}%")
                 st.markdown(f"<div class='metric-subtext'><b>Триггер</b>. Выход из зон 0% или 100% дает точную точку разворота.</div>", unsafe_allow_html=True)

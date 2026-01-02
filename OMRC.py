@@ -290,4 +290,29 @@ if not tokens.empty:
                     {"Strategy": f"MARTINGALE (x{mart_input})", **res_mart},
                 ]
                 
-                res_df = pd.DataFrame(compare
+                res_df = pd.DataFrame(compare_data).set_index("Strategy")
+                
+                # Форматирование
+                st.dataframe(res_df.style.format({
+                    "Profit ($)": "{:+.2f}",
+                    "Max DD (%)": "{:.2f}%",
+                    "Win Rate": "{:.1f}%",
+                    "Final Balance": "{:.2f}"
+                }).applymap(lambda v: 'color: #3fb950; font-weight: bold' if v > 0 else 'color: #f85149; font-weight: bold', subset=['Profit ($)']), 
+                use_container_width=True)
+
+                # Выводы
+                best_strat = res_df['Profit ($)'].idxmax()
+                best_profit = res_df['Profit ($)'].max()
+                
+                if best_profit > 0:
+                    st.success(f"🏆 Лучшая стратегия: **{best_strat}** с прибылью **${best_profit:.2f}**")
+                    st.info(f"ℹ️ Данные за последние 7 дней (таймфрейм 5m). TP срабатывает по High свечи, докупка по Low.")
+                else:
+                    st.warning("📉 На текущем рынке все варианты убыточны. Попробуйте другой коин или увеличьте шаг докупки.")
+                
+            else:
+                st.error("Мало данных от биржи. Попробуйте позже.")
+    
+    st.markdown("---")
+    st.caption("MRC Pro Simulator v34.0 | Uses `High` for TP and `Low` for Entry | No repainting")

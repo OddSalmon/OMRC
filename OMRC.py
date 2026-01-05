@@ -64,73 +64,10 @@ def calculate_mrc_pro(df, length, mult):
     
     return df
 
-# ==========================================
-# 3. МОДУЛЬ СИМУЛЯЦИИ
-# ==========================================
-def run_simulation(df, strat_type, dca_step_pct, mart_mult, start_balance=1000, base_bet=50):
-    if strat_type == 'FIXED':
-        max_safety = 0; step = 0; mult = 0
-    elif strat_type == 'DCA':
-        max_safety = 3; step = dca_step_pct / 100; mult = 1.0
-    elif strat_type == 'MARTINGALE':
-        max_safety = 4; step = (dca_step_pct * 0.8) / 100; mult = mart_mult
-
-    balance = start_balance
-    initial_balance = balance
-    position_coins = 0
-    avg_price = 0
-    safety_count = 0
-    wins = 0; losses = 0
-    equity_curve = [balance]
-    
-    prices = df['close'].values
-    buy_levels = df['l2'].values
-    sell_levels = df['ml'].values
-    
-    start_idx = 210 if len(df) > 210 else 0
-    
-    for i in range(start_idx, len(df)):
-        price = prices[i]
-        
-        if position_coins == 0:
-            if price < buy_levels[i]: 
-                position_coins = base_bet / price
-                avg_price = price
-                safety_count = 0
-        else:
-            if price >= sell_levels[i]:
-                pnl = (price - avg_price) * position_coins
-                balance += pnl
-                if pnl > 0: wins += 1
-                else: losses += 1
-                position_coins = 0; avg_price = 0; safety_count = 0
-            elif safety_count < max_safety:
-                drop_pct = (avg_price - price) / avg_price
-                req_drop = step * (safety_count + 1)
-                if drop_pct >= req_drop:
-                    factor = mult ** safety_count if mult > 1 else 1
-                    buy_usd = base_bet * factor
-                    if buy_usd > 0:
-                        new_coins = buy_usd / price
-                        total_cost = (position_coins * avg_price) + buy_usd
-                        position_coins += new_coins
-                        avg_price = total_cost / position_coins
-                        safety_count += 1
-        
-        unrealized = (price - avg_price) * position_coins if position_coins > 0 else 0
-        equity_curve.append(balance + unrealized)
-
-    equity_series = pd.Series(equity_curve)
-    net_profit = balance - initial_balance
-    dd = (equity_series - equity_series.cummax()).min()
-    dd_pct = (dd / initial_balance) * 100
-    trades = wins + losses
-    win_rate = (wins / trades * 100) if trades > 0 else 0
-    
-    return {"SCENARIO": strat_type, "PROFIT": net_profit, "WIN RATE": win_rate, "MAX DD": dd_pct, "TRADES": trades}
+# (Раздел 3 "МОДУЛЬ СИМУЛЯЦИИ" полностью удален)
 
 # ==========================================
-# 4. ASYNC DATA FETCHING (ИСПРАВЛЕНО)
+# 4. ASYNC DATA FETCHING
 # ==========================================
 
 async def fetch_candles_async(session, coin):
@@ -147,8 +84,6 @@ async def fetch_candles_async(session, coin):
     except:
         return pd.DataFrame()
 
-# --- НОВАЯ ФУНКЦИЯ: ОБЕРТКА ДЛЯ ОДИНОЧНОГО ЗАПРОСА ---
-# Она создает сессию внутри async контекста, чтобы aiohttp не ругался
 async def fetch_single_coin_safe(coin):
     async with aiohttp.ClientSession() as session:
         return await fetch_candles_async(session, coin)
@@ -162,7 +97,7 @@ def get_tokens():
     except: return pd.DataFrame()
 
 # ==========================================
-# 5. ЛОГИКА ОПТИМИЗАЦИИ
+# 5. ЛОГИКА ОПТИМИЗАЦИИ (СКАНЕР)
 # ==========================================
 
 def optimize_logic_sync(df_1m, coin):
@@ -235,9 +170,9 @@ if "market_cache" not in st.session_state:
     st.session_state.market_cache = {}
 
 tokens_df = get_tokens()
-tab1, tab2 = st.tabs(["🎯 РЫНОЧНЫЙ СКАНЕР", "🔍 ПОЛНЫЙ АНАЛИЗ + BACKTEST"])
+tab1, tab2 = st.tabs(["🎯 РЫНОЧНЫЙ СКАНЕР", "🔍 ПОЛНЫЙ АНАЛИЗ"])
 
-# --- TAB 1 ---
+# --- TAB 1: SCANNER ---
 with tab1:
     st.subheader("Мульти-Таймфрейм Сканер (Async)")
     cols = st.columns(5)
@@ -278,7 +213,7 @@ with tab1:
         st.cache_data.clear()
         st.rerun()
 
-# --- TAB 2 ---
+# --- TAB 2: ANALYSIS ONLY ---
 with tab2:
     target_coin = st.selectbox("Выберите монету", tokens_df['name'].tolist())
     
@@ -291,7 +226,6 @@ with tab2:
         cfg = st.session_state.market_cache[target_coin]
         
         if cfg and cfg.get('tf'):
-            # --- ИСПРАВЛЕННЫЙ ВЫЗОВ (ИСПОЛЬЗУЕМ БЕЗОПАСНУЮ ФУНКЦИЮ) ---
             df_raw = asyncio.run(fetch_single_coin_safe(target_coin))
             
             df_tf = df_raw.set_index('ts').resample(f"{cfg['tf']}T").agg({'open':'first','high':'max','low':'min','close':'last'}).dropna().reset_index()
@@ -321,22 +255,4 @@ with tab2:
                 with cm: st.markdown(f"<div class='target-card'><div class='level-label'>FAIR VALUE (MEAN)</div><div class='level-price' style='color:#58a6ff'>{last['ml']:.4f}</div></div>", unsafe_allow_html=True)
                 with cs: st.markdown(f"<div class='entry-card-short'><div class='level-label'>SHORT ENTRY (U2)</div><div class='level-price'>{last['u2']:.4f}</div></div>", unsafe_allow_html=True)
 
-                st.divider()
-
-                st.subheader(f"⚡ Симуляция (Backtest) на {len(df)} свечах")
-                with st.expander("⚙️ Настройки симуляции", expanded=True):
-                    sc1, sc2, sc3 = st.columns(3)
-                    with sc1: dca_step = st.number_input("Шаг DCA (%)", 0.1, 10.0, 1.5, 0.1)
-                    with sc2: mart_mult = st.number_input("Множитель Мартингейла", 1.0, 3.0, 1.5, 0.1)
-                    with sc3: depo = st.number_input("Депозит ($)", 100, 100000, 1000, 100)
-                
-                res_fixed = run_simulation(df, 'FIXED', dca_step, mart_mult, depo)
-                res_dca = run_simulation(df, 'DCA', dca_step, mart_mult, depo)
-                res_mart = run_simulation(df, 'MARTINGALE', dca_step, mart_mult, depo)
-                
-                sim_df = pd.DataFrame([res_fixed, res_dca, res_mart])
-                st.dataframe(sim_df.style.format({"PROFIT": "${:,.2f}", "WIN RATE": "{:.1f}%", "MAX DD": "{:.2f}%"}).applymap(lambda v: 'color: salmon;' if v < 0 else 'color: lightgreen;', subset=['PROFIT']), use_container_width=True)
-                
-                best_s = sim_df.sort_values('PROFIT', ascending=False).iloc[0]
-                if best_s['PROFIT'] > 0: st.info(f"💡 Лучший результат: **{best_s['SCENARIO']}** (+${best_s['PROFIT']:.2f})")
-                else: st.error("⚠️ Стратегия убыточна на этом участке истории.")
+                # Блок симуляции удален
